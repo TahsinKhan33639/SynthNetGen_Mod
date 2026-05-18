@@ -4,7 +4,13 @@
 ```bash
 chmod +x build.sh
 ./build.sh
+```
 
 ## Usage
-./rpll.sh <target> <output>
-or ./rpll.sh <target> <output> <synth_base>
+```bash
+./rpl1.sh <target> <output>
+```
+or
+```bash
+./rpl1.sh <target> <output> <synth_base>
+```
