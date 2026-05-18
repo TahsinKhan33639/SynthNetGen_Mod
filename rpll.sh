@@ -1,4 +1,4 @@
-# Usage: ./rpll.sh target output
+#!/bin/bash
 
 rm -f baseline_val_*.txt outinp_val_*.txt synth1_*.txt \
       outinp_l_val_*.txt suminp_val_*.txt bext_val_*.txt \
