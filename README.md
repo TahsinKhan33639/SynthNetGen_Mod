@@ -8,9 +8,9 @@ chmod +x build.sh
 
 ## Usage
 ```bash
-./rpll.sh <target> <output>
+./rpll.sh <target> <output> <rounds>
 ```
 or
 ```bash
-./rpll.sh <target> <output> <synth_base>
+./rpll.sh <target> <output> <synth_base> <rounds>
 ```

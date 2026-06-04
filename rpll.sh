@@ -3,42 +3,49 @@
 rm -f baseline_val_*.txt outinp_val_*.txt synth1_*.txt \
       outinp_l_val_*.txt suminp_val_*.txt bext_val_*.txt \
 	  inp1l_*.txt synth_base_*.txt tmp_round*.txt
-rm -f round_results.tmp inp.txt inpl.txt vecBS*.txt vecOutty.txt trfBS.txt target_c.txt smth.txt \
-	  out_inplxzx.txt data1.txt data_middle.txt vecInS.txt vecTar.txt
+rm -f round_results.tmp inp.txt inpl.txt vecBS*.txt vecOutty.txt trfBS.txt target_c.txt smth.txt bres.tmp \
+	  out_inplxzx.txt data1.txt data_middle.txt vecInS.txt vecTar.txt bextxzx.txt suminpxzx.txt data_middle1.txt
 rm -rf baseline
 
 set -e
 
-if [ $# -eq 2 ]; then
-	echo "a"
+if [ $# -eq 3 ]; then
 	TARGET0="$1"
 	FINAL="$2"
+	ROUNDS="$3"
 	TARGET="target_c.txt"
 
 	./cleanup "$TARGET0" "$TARGET"
 	./gen_deg2 "$TARGET" synth_base_1.txt
-	./expfc "$TARGET" synth_base_1.txt 50000 50000 1 8 2.0 50 > synth_base_2.txt
-	./expfc "$TARGET" synth_base_2.txt 10000 10000 1 8 1.8 40 > synth_base_3.txt
-	./expfc "$TARGET" synth_base_3.txt 10000 10000 1 8 1.6 30 > synth_base_4.txt
-	./expfc "$TARGET" synth_base_4.txt 10000 10000 1 8 1.5 24 > synth_base_5.txt
-	./expfc "$TARGET" synth_base_5.txt 10000 10000 1 8 1.4 20 > synth_base_6.txt
-	./expfc "$TARGET" synth_base_6.txt 10000 10000 1 8 1.3 15 > synth_base_7.txt
-	./expfc "$TARGET" synth_base_7.txt 10000 10000 1 8 1.2 12 > synth_base_8.txt
-	./expfc "$TARGET" synth_base_8.txt 10000 10000 1 8 1.1 10 > synth_base_9.txt
-	./expfc "$TARGET" synth_base_9.txt 10000 10000 1 8 1.0 9 > synth_base_10.txt
-	./expfc "$TARGET" synth_base_10.txt 10000 10000 1 8 0.9 8 > synth_base_11.txt
-	./expfc "$TARGET" synth_base_11.txt 10000 10000 1 8 0.8 7 > synth_base_12.txt
-	./expfc "$TARGET" synth_base_12.txt 10000 10000 1 8 0.7 6 > synth_base_13.txt
-	./expfc "$TARGET" synth_base_13.txt 10000 10000 1 8 0.6 5 > synth_base_14.txt
-	./expfc "$TARGET" synth_base_14.txt 10000 10000 1 8 0.5 4 > synth_base_15.txt
-	./expfc "$TARGET" synth_base_15.txt 10000 10000 1 8 0.5 3 > synth_base_16.txt
-	./expfc "$TARGET" synth_base_16.txt 10000 10000 1 8 0.5 2 > synth_base_17.txt
 
-	INIT_SYNTH=synth_base_17.txt
-elif [ $# -eq 3 ]; then
+	./bnb 4 synth_base_1.txt > bres.tmp
+	cat data_middle.txt > data_middle1.txt
+	./expfy "$TARGET" synth_base_1.txt 50000 50000 1 8 2.0 50 200 > synth_base_2.txt
+	./bnb 4 synth_base_2.txt > bres.tmp
+	cat data_middle.txt > data_middle1.txt
+	./expfy "$TARGET" synth_base_2.txt 10000 10000 1 8 1.7 30 150 > synth_base_3.txt
+	./bnb 4 synth_base_3.txt > bres.tmp
+	cat data_middle.txt > data_middle1.txt
+	./expfy "$TARGET" synth_base_3.txt 10000 10000 1 8 1.5 20 120 > synth_base_4.txt
+	./bnb 4 synth_base_4.txt > bres.tmp
+	cat data_middle.txt > data_middle1.txt
+	./expfy "$TARGET" synth_base_4.txt 10000 10000 1 8 1.3 18 100 > synth_base_5.txt
+	./bnb 4 synth_base_5.txt > bres.tmp
+	cat data_middle.txt > data_middle1.txt
+	./expfy "$TARGET" synth_base_5.txt 10000 1000 1 17 1.2 16 100 > synth_base_6.txt
+	./bnb 4 synth_base_6.txt > bres.tmp
+	cat data_middle.txt > data_middle1.txt
+	./expfy "$TARGET" synth_base_6.txt 10000 1000 1 17 1.1 15 100 > synth_base_7.txt
+	./bnb 4 synth_base_7.txt > bres.tmp
+	cat data_middle.txt > data_middle1.txt
+	./expfy "$TARGET" synth_base_7.txt 10000 1000 1 17 1 14 100 > synth_base_8.txt
+
+	INIT_SYNTH=synth_base_8.txt
+elif [ $# -eq 4 ]; then
 	TARGET0="$1"
 	FINAL="$2"
 	INIT_SYNTH="$3"
+	ROUNDS="$4"
 	TARGET="target_c.txt"
 	./cleanup "$TARGET0" "$TARGET"
 else
@@ -46,13 +53,13 @@ else
     exit 1
 fi
 
-ROUNDS=24
 evb=1
-degb=4
-CANDS=($(seq 1 56 | grep -v -E '^(25|26)$'))
+degb=20
+hdgb=100
+CANDS=($(seq 1 60 | grep -v -E '^(25|26)$'))
 
 declare -a ec
-for i in {1..56}; do
+for i in {1..60}; do
     ec[$i]=0
 done
 ec[27]=2;
@@ -82,6 +89,13 @@ ec[50]=-1;
 ec[51]=-1;
 ec[52]=-1;
 ec[53]=-1;
+ec[54]=0;
+ec[55]=0;
+ec[56]=0;
+ec[57]=0;
+ec[58]=-2;
+ec[59]=+3;
+ec[60]=+1;
 
 BASELINE_DIR="baseline"
 mkdir -p "$BASELINE_DIR"
@@ -149,7 +163,7 @@ print(rmse)
 EOF
 }
 
-# Apply expfc with one type
+# Apply expfy with one type
 apply_exp() {
     local INPUT_FILE="$1"
     local SCALE="$2"
@@ -167,12 +181,12 @@ apply_exp() {
 	fi
 
     if [ "$VAL" -ne 25 ] && [ "$VAL" -ne 26 ]; then
-        ./expfc "$TARGET" "$INPUT_FILE" "$SCALE" 0 "$VAL" 1 "$evb" "$degb" > "$OUTPUT_FILE"
+        ./expfy "$TARGET" "$INPUT_FILE" "$SCALE" 0 "$VAL" 1 "$evb" "$degb" "$hdgb" > "$OUTPUT_FILE"
     fi
 }
 
 
-# Apply expfc with two types
+# Apply expfy with two types
 apply_exp2() {
     local INPUT_FILE="$1"
     local SCALE="$2"
@@ -202,7 +216,7 @@ apply_exp2() {
 	fi
 
     if [ "$VAL" -ne 25 ] && [ "$VAL" -ne 26 ]; then
-        ./expfc "$TARGET" "$INPUT_FILE" "$SCALE" "$SCALE2" "$VAL" "$VAL2" "$evb" "$degb" > "$OUTPUT_FILE"
+        ./expfy "$TARGET" "$INPUT_FILE" "$SCALE" "$SCALE2" "$VAL" "$VAL2" "$evb" "$degb" "$hdgb" > "$OUTPUT_FILE"
     fi
 }
 
@@ -211,6 +225,9 @@ apply_exp2() {
 run_round() {
     local INPUT_SYNTH="$1"
     local OUTPUT_SYNTH="$2"
+
+	./bnb 4 "$INPUT_SYNTH" > bres.tmp
+	cat data_middle.txt > data_middle1.txt
 
 	displ vecInS.txt vecTar.txt inpl.txt
 	cat vecInS.txt vecTar.txt > inp.txt
@@ -238,7 +255,7 @@ run_round() {
 		    OUT_INP2="outinp_val_${VAL2}.txt"
 
 		    cat inp.txt "$OUT_INP" "$OUT_INP2" > "$SUMINP"
-		    ./bxk4ue "${ec[$VAL]}" "${ec[$VAL2]}" "$CMODE" < "$SUMINP" > "$BEXT"
+		    ./bxk4f "${ec[$VAL]}" "${ec[$VAL2]}" "$CMODE" < "$SUMINP" > "$BEXT"
 
 		    read mag mag2 val < "$BEXT"
 
@@ -270,6 +287,23 @@ run_round() {
 
 		./bnb 4 "$OUTPUT_SYNTH" > vecOutty.txt
 	    displ vecInS.txt vecOutty.txt out_inplxzx.txt
+
+		cat inp.txt out_inplxzx.txt > suminpxzx.txt
+
+		./bxk4one "$CMODE" < suminpxzx.txt > bextxzx.txt
+
+	    read mag < bextxzx.txt
+		SCALE=$(awk "BEGIN {print int($SCALE * $mag)}")
+		SCALE2=$(awk "BEGIN {print int($SCALE2 * $mag)}")
+
+	    sorted_MAG="$SCALE"
+		sorted_MAG2="$SCALE2"
+
+		apply_exp2 "$INPUT_SYNTH" "$SCALE" "$SCALE2" "$sorted_VAL" "$sorted_VAL2" "$OUTPUT_SYNTH"
+
+		./bnb 4 "$OUTPUT_SYNTH" > vecOutty.txt
+	    displ vecInS.txt vecOutty.txt out_inplxzx.txt
+
 	    got_rmse=$(rmse out_inplxzx.txt inpl.txt)
 
 	    echo "VAL=$sorted_VAL,$sorted_VAL2 MAG=$sorted_MAG,MAG2=$sorted_MAG2. expected RMSE=$sorted_rmse, got RMSE=$got_rmse."
@@ -283,8 +317,6 @@ run_round() {
 		fi
 
 	done < <(sort -n "$RESULTS_FILE" | head -n 10)
-
-    # Apply expfc to make OUTPUT_SYNTH
 
     SCALE=$(echo "($BEST_MAG * 1)/1" | bc)
     SCALE2=$(echo "($BEST_MAG2 * 1)/1" | bc)
@@ -313,31 +345,19 @@ generate_outinp() {
 	    OUT_INP="outinp_val_${VAL}.txt"
 		> "$OUT_INP"
 
-		SCALE=1500
+		SCALE=30000
 		apply_exp "$InS" "$SCALE" "$VAL" "$BASE_SYNTH1"
 		./bnb 4 "$BASE_SYNTH1" > vecBS1.txt
 		displ vecInS.txt vecBS1.txt trfBS.txt
 		cat trfBS.txt >> "$OUT_INP"
 
-		SCALE=8000
+		SCALE=300000
 		apply_exp "$InS" "$SCALE" "$VAL" "$BASE_SYNTH2"
 		./bnb 4 "$BASE_SYNTH2" > vecBS2.txt
 		displ vecInS.txt vecBS2.txt trfBS.txt
 		cat trfBS.txt >> "$OUT_INP"
 
-		SCALE=50000
-		apply_exp "$InS" "$SCALE" "$VAL" "$BASE_SYNTH3"
-		./bnb 4 "$BASE_SYNTH3" > vecBS3.txt
-		displ vecInS.txt vecBS3.txt trfBS.txt
-		cat trfBS.txt >> "$OUT_INP"
-
-		SCALE=300000
-		apply_exp "$InS" "$SCALE" "$VAL" "$BASE_SYNTH4"
-		./bnb 4 "$BASE_SYNTH4" > vecBS4.txt
-		displ vecInS.txt vecBS4.txt trfBS.txt
-		cat trfBS.txt >> "$OUT_INP"
-
-		rm "$BASE_SYNTH1" "$BASE_SYNTH2" "$BASE_SYNTH3" "$BASE_SYNTH4"
+		rm "$BASE_SYNTH1" "$BASE_SYNTH2"
 	done
 }
 
@@ -355,26 +375,33 @@ for ((i=1; i<=ROUNDS; i++)); do
 
     if (( i == 3 )); then
         evb=1
-		degb=4
+		degb=18
+		hdgb=90
     fi
     if (( i == 7 )); then
         evb=1
-		degb=3
+		degb=17
+		hdgb=85
     fi
     if (( i == 11 )); then
-        evb=1
-		degb=3
+        evb=0.9
+		degb=16
+		hdgb=80
     fi
     if (( i == 15 )); then
         evb=0.7
-		degb=3
+		degb=15
+		hdgb=75
     fi
     if (( i == 23 )); then
         evb=0.5
-		degb=2
+		degb=14
+		hdgb=70
     fi
 
     if (( (i-1) % 4 == 0 )); then
+		./bnb 4 "$CURRENT" > bres.tmp
+		cat data_middle.txt > data_middle1.txt
         generate_outinp "$CURRENT"
     fi
 
@@ -389,6 +416,6 @@ echo "Final output stored in $FINAL"
 rm -f baseline_val_*.txt outinp_val_*.txt synth1_*.txt \
       outinp_l_val_*.txt suminp_val_*.txt bext_val_*.txt \
 	  inp1l_*.txt synth_base_*.txt tmp_round*.txt
-rm -f round_results.tmp inp.txt inpl.txt vecBS*.txt vecOutty.txt trfBS.txt target_c.txt smth.txt \
-	  out_inplxzx.txt data1.txt data_middle.txt vecInS.txt vecTar.txt
+rm -f round_results.tmp inp.txt inpl.txt vecBS*.txt vecOutty.txt trfBS.txt target_c.txt smth.txt bres.tmp\
+	  out_inplxzx.txt data1.txt data_middle.txt vecInS.txt vecTar.txt bextxzx.txt suminpxzx.txt data_middle1.txt
 rm -rf baseline

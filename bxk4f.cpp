@@ -24,13 +24,15 @@ Vec6 lerp(const Vec6& P, const Vec6& Q, double u){
     return R;
 }
 
+//////////////////////////////////////////////////////
+// Piecewise displacement
+//////////////////////////////////////////////////////
+
 Vec6 displacement(
     double x,
-    double ka, double kb, double kc, double kd,
+    double ka, double kb,
     const Vec6& A,
-    const Vec6& B,
-    const Vec6& C,
-    const Vec6& D
+    const Vec6& B
 ){
     Vec6 O{}; // zero vector
 
@@ -38,33 +40,29 @@ Vec6 displacement(
         double u = (ka==0 ? 0 : x/ka);
         return lerp(O, A, u);
     }
-    else if(x <= kb){
+    else {
         double u = (x - ka)/(kb - ka);
         return lerp(A, B, u);
     }
-    else if(x <= kc){
-        double u = (x - kb)/(kc - kb);
-        return lerp(B, C, u);
-    }
-    else{
-        double u = (x - kc)/(kd - kc);
-        return lerp(C, D, u);
-    }
 }
 
-vector<double> build_grid(double kd){
+//////////////////////////////////////////////////////
+// Error function
+//////////////////////////////////////////////////////
+
+vector<double> build_grid(double kb){
     vector<double> xs;
 
-    for(double x=0; x<=600; x+=12)
+    for(double x=0; x<=600; x+=24)
         xs.push_back(x);
 
-    for(double x=600; x<=6000; x+=60)
+    for(double x=600; x<=6000; x+=240)
         xs.push_back(x);
 
-    for(double x=6000; x<=60000; x+=180)
+    for(double x=6000; x<=60000; x+=2400)
         xs.push_back(x);
 
-    for(double x=60000; x<=kd; x+=1500)
+    for(double x=60000; x<=kb*10; x+=12000)
         xs.push_back(x);
 
     return xs;
@@ -75,18 +73,14 @@ double F6_piece(
     const Vec6& initial,
     double x,
     double y,
-    double ka, double kb, double kc, double kd,
+    double ka, double kb,
     const Vec6& A,
     const Vec6& B,
-    const Vec6& C,
-    const Vec6& D,
     const Vec6& A2,
-    const Vec6& B2,
-    const Vec6& C2,
-    const Vec6& D2
+    const Vec6& B2
 ){
-    Vec6 v = displacement(x, ka, kb, kc, kd, A, B, C, D);
-    Vec6 v2 = displacement(y, ka, kb, kc, kd, A2, B2, C2, D2);
+    Vec6 v = displacement(x, ka, kb, A, B);
+    Vec6 v2 = displacement(y, ka, kb, A2, B2);
 
     double sum = 0;
     for(int i=0;i<6;i++){
@@ -98,18 +92,18 @@ double F6_piece(
     return sqrt(sum);
 }
 
+//////////////////////////////////////////////////////
+// Brute search
+//////////////////////////////////////////////////////
+
 pair<pair<double,double>, double> minimize_piece(
     const Vec6& target,
     const Vec6& initial,
-    double ka, double kb, double kc, double kd,
+    double ka, double kb,
     const Vec6& A,
     const Vec6& B,
-    const Vec6& C,
-    const Vec6& D,
     const Vec6& A2,
     const Vec6& B2,
-    const Vec6& C2,
-    const Vec6& D2,
 	const int e1,
 	const int e2
 ){
@@ -117,12 +111,12 @@ pair<pair<double,double>, double> minimize_piece(
     double bestY = 0;
     double bestF = 200;
 
-	auto xs = build_grid(kd);
-	auto ys = build_grid(kd);
+	auto xs = build_grid(kb);
+	auto ys = build_grid(kb);
 	if (e1 == e2 && e1 == 0){
 		for(double x : xs){
 		    for(double y : ys){
-		        double f = F6_piece(target, initial, x, y, ka, kb, kc, kd, A, B, C, D, A2, B2, C2, D2);
+		        double f = F6_piece(target, initial, x, y, ka, kb, A, B, A2, B2);
 
 		        if(f < bestF){
 		            bestF = f;
@@ -136,7 +130,7 @@ pair<pair<double,double>, double> minimize_piece(
 		for (double x : xs){
 			double y = x*(double)e1/(double)e2;
 			y = abs(y);
-            double f = F6_piece(target, initial, x, y, ka, kb, kc, kd, A, B, C, D, A2, B2, C2, D2);
+            double f = F6_piece(target, initial, x, y, ka, kb, A, B, A2, B2);
 
             if(f < bestF){
                 bestF = f;
@@ -149,6 +143,9 @@ pair<pair<double,double>, double> minimize_piece(
     return {{bestX, bestY}, bestF};
 }
 
+//////////////////////////////////////////////////////
+// MAIN
+//////////////////////////////////////////////////////
 int main(int argc, char* argv[]) {
     int e1 = stoi(argv[1]);
     int e2 = stoi(argv[2]);
@@ -176,8 +173,9 @@ int main(int argc, char* argv[]) {
     wes = all_weights[cm];
 
     Vec6 target, initial, A, B, C, D, A2, B2, C2, D2;
-    double ka = 1500, kb = 8000, kc = 50000, kd = 300000;
+    double ka = 30000, kb = 300000;
 
+    // target
     for(int i=0;i<6;i++) cin >> initial[i];
     for(int i=0;i<6;i++) cin >> target[i];
 	for(int i=0;i<6;i++){
@@ -187,18 +185,21 @@ int main(int argc, char* argv[]) {
 		else initial[i] = -15;
 	}
 
+    // breakpoints
+    //cin >> ka >> kb >> kc;
+
+    // vectors
     for(int i=0;i<6;i++) cin >> A[i];
     for(int i=0;i<6;i++) cin >> B[i];
-    for(int i=0;i<6;i++) cin >> C[i];
-    for(int i=0;i<6;i++) cin >> D[i];
     for(int i=0;i<6;i++) cin >> A2[i];
     for(int i=0;i<6;i++) cin >> B2[i];
-    for(int i=0;i<6;i++) cin >> C2[i];
-    for(int i=0;i<6;i++) cin >> D2[i];
 
     auto [bestXY, bestF] =
-        minimize_piece(target, initial, ka, kb, kc, kd, A, B, C, D, A2, B2, C2, D2, e1, e2);
+        minimize_piece(target, initial, ka, kb, A, B, A2, B2, e1, e2);
 	auto [bestX, bestY] = bestXY;
 
-    cout << bestX << " " << bestY << " " << bestF << "\n";
+	cout << fixed << setprecision(0)
+	     << bestX << " " << bestY << " ";
+
+	cout << setprecision(10) << bestF << "\n";
 }

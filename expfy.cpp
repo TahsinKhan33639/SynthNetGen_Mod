@@ -74,7 +74,6 @@ unordered_map<int, int> adj6bit_to_id = {
     {0b111111, 10},
 };
 
-// adj -> gid
 int get_graph_id(const vector<vector<int>>& adj) {
     int bits = 0;
     bits |= adj[2][3] ? (1 << 0) : 0;
@@ -89,11 +88,16 @@ int get_graph_id(const vector<vector<int>>& adj) {
         return -1;
 }
 
-// Main loop
 void sample_edge_prob(vector<vector<int>>& adj, vector<vector<char>>& bvv, int num_samples, int num_samples2, int m1, int m2,
-					 vector<ld> x, ld evl, ld evbound, vector<int> degb, int degbound) {
-
+					 vector<ld> x, ld evl, ld evbound, vector<int> degb, int degbound, vector<int> gdnd, int hdgbound) {
+	vector<double> cntr(6, 0);
     int n = adj.size();
+	vector<bool> gnif(n, false);
+	for (auto i : gdnd) gnif[i] = true;
+    if (n < 4) {
+        cerr << "Graph must have at least 4 nodes.\n";
+        return;
+    }
     random_device rd;
     mt19937 rng(rd());
 
@@ -111,10 +115,11 @@ void sample_edge_prob(vector<vector<int>>& adj, vector<vector<char>>& bvv, int n
 	for(int i = 0; i<n; i++){
 		deg[i] = adj[i].size();
 	}
-	int leaft, leafc, leafz;
+
+	vector<int> hdg(n, 0), hdgz(n, 0), hdgb(n, 0);
 	for(int i=0; i<n; i++){
-		if (degb[i] == 1) leaft++;
-		if (deg[i] == 1) leafc++;
+		hdg[deg[i]]++;
+		hdgb[degb[i]]++;
 	}
 
 	auto j = [&](int u, int v) {
@@ -123,9 +128,9 @@ void sample_edge_prob(vector<vector<int>>& adj, vector<vector<char>>& bvv, int n
 	    bvv[v][u] = bvv[u][v] = 1;
 		y[u] = y[u] + 1/evl*x[v];
 		y[v] = y[v] + 1/evl*x[u];
+		hdg[deg[u]]--; hdg[deg[v]]--;
 		deg[u]++; deg[v]++;
-		if(deg[u] == 2) leafc--;
-		if(deg[v] == 2) leafc--;
+		hdg[deg[u]]++; hdg[deg[v]]++;
 		edgec++;
 	};
 
@@ -135,15 +140,17 @@ void sample_edge_prob(vector<vector<int>>& adj, vector<vector<char>>& bvv, int n
 	    bvv[v][u] = bvv[u][v] = 0;
 		y[u] = y[u] - 1/evl*x[v];
 		y[v] = y[v] - 1/evl*x[u];
+		hdg[deg[u]]--; hdg[deg[v]]--;
 		deg[u]--; deg[v]--;
-		if(deg[u] == 1) leafc++;
-		if(deg[v] == 1) leafc++;
+		hdg[deg[u]]++; hdg[deg[v]]++;
 		edgec--;
 	};
 
 	int donereps = 0;
 	int donereps2 = 0;
 	int m = m1;
+
+	int lklk1=0, lklk2=0, lklk3=0, lklk4=0;
 
     auto op = [&](const vector<tuple<int,int,int>>& ops) {
         bool open = true;
@@ -161,7 +168,7 @@ void sample_edge_prob(vector<vector<int>>& adj, vector<vector<char>>& bvv, int n
             ld old_dist = abs(log(old_val) - target);
             if (new_dist < old_dist)
                 return true;
-
+			lklk1++;
             return false;
         };
 
@@ -179,8 +186,27 @@ void sample_edge_prob(vector<vector<int>>& adj, vector<vector<char>>& bvv, int n
             int old_dist = abs(old_val - target);
             if (new_dist < old_dist)
                 return true;
-
+			lklk2++;
             return false;
+        };
+
+        auto validhdg = [&](int dgX, int new_val) {
+            int old_val = hdg[dgX];
+            if (new_val <= 0 || old_val <= 0)
+                return false;
+
+            int target = hdgb[dgX];
+
+            int new_dist = abs(new_val - target);
+            if (new_dist <= hdgbound)
+                return true;
+
+            int old_dist = abs(old_val - target);
+            if (new_dist < old_dist)
+                return true;
+
+			lklk3++;
+            return true;
         };
 
         set<int> nodesinop;
@@ -199,11 +225,13 @@ void sample_edge_prob(vector<vector<int>>& adj, vector<vector<char>>& bvv, int n
                 z[n1] += 1/evl*x[n2];
                 z[n2] += 1/evl*x[n1];
                 degz[n1]++; degz[n2]++;
+				if (bvv[n1][n2] == 1) open = false;
             }
             if (type == 2){
                 z[n1] -= 1/evl*x[n2];
                 z[n2] -= 1/evl*x[n1];
                 degz[n1]--; degz[n2]--;
+				if (bvv[n1][n2] == 0) open = false;
             }
         }
 
@@ -212,17 +240,23 @@ void sample_edge_prob(vector<vector<int>>& adj, vector<vector<char>>& bvv, int n
             open &= valideg(ndX, degz[ndX]);
         }
 
-        leafz = leafc;
+		set<int> related_deg;
         for(auto ndX : nodesinop){
-            if (deg[ndX] == 1 && degz[ndX] != 1) leafz--;
-            if (deg[ndX] != 1 && degz[ndX] == 1) leafz++;
+            related_deg.insert(deg[ndX]);
+            related_deg.insert(degz[ndX]);
         }
-        bool subopen = false;
-        if (abs(leafz - leaft) <= abs(leafc - leaft)) subopen = true;
-        if (leafz >= leaft*(1-0.02*degbound) && leafz <= leaft*(1+0.02*degbound)) subopen = true;
-        open &= subopen;
+		for (auto rdeg : related_deg) {
+			hdgz[rdeg] = hdg[rdeg];
+		}
+        for(auto ndX : nodesinop){
+            hdgz[deg[ndX]]--; hdgz[degz[ndX]]++;
+		}
+		for (auto rdeg : related_deg) {
+            open &= validhdg(rdeg, hdgz[rdeg]);
+		}
 
         if (!open) return;
+		lklk4++;
         if (m == m1) donereps++;
         if (m == m2) donereps2++;
         for (auto [type, n1, n2] : ops) {
@@ -239,44 +273,65 @@ void sample_edge_prob(vector<vector<int>>& adj, vector<vector<char>>& bvv, int n
 
 	for (int smpl = 0; (donereps < num_samples) || (donereps2 < num_samples2); smpl++) {
 
-		if ((double)donereps / num_samples > (double)donereps2 / num_samples2 + 0.05) m = m2;
-		if ((double)donereps / num_samples < (double)donereps2 / num_samples2 - 0.05) m = m1;
+		if ((double)donereps / num_samples > (double)donereps2 / num_samples2 + 0.02) m = m2;
+		if ((double)donereps / num_samples < (double)donereps2 / num_samples2 - 0.02) m = m1;
 
 		if (donereps2 == num_samples2) m = m1;
 		if (donereps == num_samples) m = m2;
 
-		//if (smpl > 1000*num_samples) {cerr << "Too rare initial\n"; break;}
 		auto now = Clock::now();
 		if (std::chrono::duration_cast<std::chrono::seconds>(now - start).count() >= 20) {
         	break;
 		}
         vector<int> nodes;
 
-        uniform_int_distribution<int> dist0(0, n - 1);
-        int node1 = dist0(rng);
-		nodes.push_back(node1);
+		uniform_int_distribution<int> dist0(0, n - 1);
+		uniform_real_distribution<double> prob(0.0, 1.0);
+
+		int node1 = dist0(rng);
+
+		if (m == m1) {
+			while (!gnif[node1]) {
+				if (prob(rng) < 0.2) break;
+				node1 = dist0(rng);
+			}
+		}
+		if (m == m2) {
+			while (!gnif[node1]) {
+				if (prob(rng) < 0.2) break;
+				node1 = dist0(rng);
+			}
+		}
+        nodes.push_back(node1);
 
 		vector<char> blocked(adj.size(), false);
 		for (int x : nodes) blocked[x] = true;
 		blocked[node1] = true;
 	    vector<int> options;
 	    options.reserve(32);
-		auto pick_neighbor = [&](const vector<int>& candidates) -> int {
-		    for (int u : candidates) {
-		        for (int v : adj[u]) {
-		            if (!blocked[v]) {
-		                blocked[v] = true;
-		                options.push_back(v);
-		            }
-		        }
-		    }
-		    if (options.empty()) return -1;
 
-		    uniform_int_distribution<int> dist(0, options.size() - 1);
-		    int newx = options[dist(rng)];
-			options.erase(remove(options.begin(), options.end(), newx),options.end());
-			return newx;
-		};
+        auto pick_neighbor = [&](const vector<int>& cds) -> int {
+            int v = nodes[0];
+            if (m == m1) {
+				while (find(cds.begin(), cds.end(), v) != cds.end()){
+	                int u = cds[rng() % cds.size()];
+	                v = adj[u][rng() % adj[u].size()];
+					if (!gnif[v]){
+						if (prob(rng) < 0.7) v = nodes[0];
+					}
+	            }
+            }
+			if (m == m2) {
+				while (find(cds.begin(), cds.end(), v) != cds.end()){
+	                int u = cds[rng() % cds.size()];
+	                v = adj[u][rng() % adj[u].size()];
+					if (!gnif[v]){
+						if (prob(rng) < 0.7) v = nodes[0];
+					}
+	            }
+            }
+			return v;
+        };
 
         int node2 = pick_neighbor({nodes[0]});
         if (node2 == -1) continue;
@@ -292,7 +347,6 @@ void sample_edge_prob(vector<vector<int>>& adj, vector<vector<char>>& bvv, int n
 
         shuffle (nodes.begin(), nodes.end(), rng);
 
-        // Build adj
         vector<vector<int>> sub(4, vector<int>(4, 0));
         for (int a = 0; a < 4; a++) {
             for (int b = 0; b < a; b++) {
@@ -300,25 +354,51 @@ void sample_edge_prob(vector<vector<int>>& adj, vector<vector<char>>& bvv, int n
                 sub[a][b] = sub[b][a] = bvv[u][v];
             }
         }
-		// if (sub[3][1] != sub[1][3] || sub[1][2] != sub[2][1] || sub[2][3] != sub[3][2] || sub[0][1] != sub[1][0] || sub[0][2] != sub[2][0] || sub[0][3] != sub[3][0]) cerr << "Something wrong happaned but idk what\n";
         int gid = get_graph_id(sub);
+		cntr[gid-5]++;
 
-		if (gid == 10 && (43 <= m && m <= 47)){
+		if (m == 60) {
+	        int node5 = pick_neighbor(nodes);
+	        if (node5 == -1) continue;
+    	    nodes.push_back(node5);
+
+	        vector<vector<int>> sub5(5, vector<int>(5, 0));
+	        for (int a = 0; a < 5; a++) {
+	            for (int b = 0; b < a; b++) {
+	                int u = nodes[a], v = nodes[b];
+	                sub5[a][b] = sub5[b][a] = bvv[u][v];
+	            }
+	        }
+
+			if (sub5[0][1]+sub5[0][2]+sub5[0][3]+sub5[0][4]+sub5[1][2]+sub5[1][3]+sub5[1][4]+sub5[2][3]+sub5[2][4]+sub5[3][4] == 9) {
+				int cpt1 = 1, cpt2 = 0;
+				for (int cptl1 = 0; cptl1 < 5; cptl1++){
+					for (int cptl2 = 0; cptl2 < cptl1; cptl2++){
+						if (sub5[cptl1][cptl2] == 0){
+							cpt1 = cptl1; cpt2 = cptl2;
+						}
+					}
+				}
+				op({{1,nodes[cpt1],nodes[cpt2]}});
+			}
+		}
+
+		if (gid == 10 && ((43 <= m && m <= 47) || m == 59)){
 			int u = -1, v = -1, w = -1, z = -1;
 			u = nodes[0];
 			v = nodes[1];
 			w = nodes[2];
 			z = nodes[3];
-			// 43: disconnect u-v
-            // 44: disconnect z-w, u-v
-            // 45: disconnect w-v, w-u
-            // 46: to 6
-            // 47: to 5
 			if (m==43) { op({{2,u,v}}); }
 			if (m==44) { op({{2,u,v}, {2,w,z}}); }
 			if (m==45) { op({{2,u,z}, {2,v,z}}); }
 			if (m==46) { op({{2,u,v}, {2,w,z}, {2,u,z}}); }
 			if (m==47) { op({{2,u,v}, {2,u,w}, {2,v,w}}); }
+			if (m==59) {
+				uniform_int_distribution<int> dist(0, adj[u].size() - 1);
+				int uuu = adj[u][dist(rng)];
+				op({{1,uuu,v}, {1,uuu,w}, {1,uuu,z}});
+			}
 		}
 		if (gid == 9 && (m == 24 || m == 31 || m == 55 || (48 <= m && m <= 49))){
 			int u = -1, v = -1, w = -1, z = -1;
@@ -334,10 +414,6 @@ void sample_edge_prob(vector<vector<int>>& adj, vector<vector<char>>& bvv, int n
 			}
 			w = nodes[blanks[2]];
 			z = nodes[blanks[3]];
-			// 24: Disconnected u z
-			// 31: to 10
-			// 48: to 8
-			// 49: to 7
 			if (m==24) { op({{1,u,v}, {2,u,z}}); }
 			if (m==31) { op({{1,u,v}}); }
 			if (m==48) { op({{2,z,w}}); }
@@ -348,7 +424,7 @@ void sample_edge_prob(vector<vector<int>>& adj, vector<vector<char>>& bvv, int n
 				if (deg[uuu] != 1) op({{1,u,v}, {2,u,uuu}});
 			}
 		}
-        if (gid == 8 && ( (21 <= m && m <= 23) || m == 27 || m == 40 || m == 32 || m == 50)){
+        if (gid == 8 && ( (21 <= m && m <= 23) || m == 27 || m == 40 || m == 32 || m == 50 || m == 57 || m == 58)){
 			int u = -1, v = -1, w = -1, z = -1;
             vector<int> dig;
             w = nodes[0];
@@ -358,14 +434,6 @@ void sample_edge_prob(vector<vector<int>>& adj, vector<vector<char>>& bvv, int n
             }
             v = nodes[dig[0]];
             u = nodes[dig[1]];
-			// diagonal
-			// 21: u z
-			// center leaf
-			// 22: u v
-			// 23: u w
-			// 27: to 10
-			// 32: add uv
-			// 40: to 6 (remove uz)
 			if (m==21) { op({{1,u,v}, {1,w,z}, {2,u,z}, {2,w,v}}); }
 			if (m==22) { op({{1,v,u}, {1,z,w}, {2,z,v}, {2,w,v}}); }
 			if (m==23) { op({{1,u,v}, {2,v,w}}); }
@@ -373,6 +441,16 @@ void sample_edge_prob(vector<vector<int>>& adj, vector<vector<char>>& bvv, int n
 			if (m==27) { op({{1,u,v}, {1,z,w}}); }
 			if (m==40) { op({{2,u,z}}); }
 			if (m==50) { op({{1,w,z}, {2,v,w}, {2,u,w}}); }
+            if (m==57) {
+                uniform_int_distribution<int> dist(0, adj[w].size() - 1);
+                int ww1 = adj[w][dist(rng)];
+                uniform_int_distribution<int> dist2(0, adj[z].size() - 1);
+                int zz1 = adj[z][dist2(rng)];
+                if (ww1 != zz1 && deg[ww1] != 1 && deg[zz1] != 1) op({{1,z,w}, {1,u,v}, {2,w,ww1}, {2,z,zz1}});
+            }
+			if (m==58) {
+				op({{2,u,z}, {2,u,w}});
+			}
 		}
         if (gid == 7 && ( (10 <= m && m <= 17) || m == 28 || m == 33 || m == 41 || m == 42 || m == 51 || m == 56)){
 			int u = -1, v = -1, w = -1, z = -1;
@@ -385,20 +463,6 @@ void sample_edge_prob(vector<vector<int>>& adj, vector<vector<char>>& bvv, int n
             }
 			u = nodes[par[0]];
 			v = nodes[par[1]];
-			// center, leaf
-			// 10: z u
-			// 11: w z
-			// 12: w u
-			// 13: u z
-			// 14: u v
-			// 15: u w
-			// to 8 Diagonal
-			// 16: u v
-			// 17: u z
-			// 28: to 10
-			// 33: to 9 (add wv)
-			// 41: to 6 (remove zu)
-			// 42: to 5 (remove uv)
 			if (m==10) { op({{1,w,v}, {2,u,v}}); }
 			if (m==11) { op({{1,w,u}, {1,w,v}, {2,z,v}, {2,z,u}}); }
 			if (m==12) { op({{1,w,u}, {1,w,v}, {2,v,u}, {2,z,u}}); }
@@ -435,22 +499,6 @@ void sample_edge_prob(vector<vector<int>>& adj, vector<vector<char>>& bvv, int n
 			for (int i = 0; i < 4; i++){
 				if (sub[i][singles[0]] == 1) w = nodes[i];
 			}
-			// u--w--v--z
-			// 1: u--w--z--v
-			// 2: u--z--v--w
-			// 3: u--z--w--v
-			// 4: u--v--w--z
-			// 5: u--v--z--w
-			// 6: w--u--z--v
-			// 7: w--z--u--v
-			// 8: w center
-			// 9: u center
-			// 29: to 10
-			// 34: to 9 (inverted u-z)
-			// 35: to 9 (inverted u-v)
-			// 37: to 8 (add uz)
-			// 38: to 7 (add uv)
-			// 52: disconnect z
 			if (m==1)  { op({{1,w,z}, {2,w,v}}); }
 			if (m==2)  { op({{1,u,z}, {2,w,u}}); }
 			if (m==3)  { op({{1,u,z}, {1,w,z}, {2,u,w}, {2,v,z}}); }
@@ -480,14 +528,6 @@ void sample_edge_prob(vector<vector<int>>& adj, vector<vector<char>>& bvv, int n
 			v = nodes[lone[1]];
 			w = nodes[lone[2]];
 			z = nodes[center];
-			//   z with u,v,w
-			// 18: center u
-			// 19: z-u-v-w
-			// 20: u-z-v-w
-			// 30: to 10
-			// 36: to 9 (inverted u-w)
-			// 39: to 7 (add wv)
-			// 53: disconnect w
 			if (m==18) { op({{1,w,u}, {1,u,v}, {2,z,w}, {2,z,v}}); }
 			if (m==19) { op({{1,u,v}, {1,w,v}, {2,w,z}, {2,z,v}}); }
 			if (m==20) { op({{1,v,w}, {2,z,w}}); }
@@ -498,44 +538,46 @@ void sample_edge_prob(vector<vector<int>>& adj, vector<vector<char>>& bvv, int n
 			if (m==54 && deg[w] != 1) { op({{1,u,v}, {2,z,w}}); }
 		}
     }
-	// cerr << donereps << " " << donereps2 << endl;
+	//cerr << donereps << " " << donereps2 << endl;
+	double sumsss = 0;
+	for (auto i : cntr) sumsss += i;
+	//for (int i = 0; i<6; i++) {cntr[i] /= sumsss; cerr << cntr[i] << " ";} cerr << sumsss << endl;
+	//cerr << lklk1 << " " << lklk2 << " " << lklk3 << " " << lklk4 << " " << endl;
 }
 
-// Read graph
-void readGraph(const string& filename, vector<vector<int>>& adj, vector<vector<char>>& adjMat) {
+void readGraph(const string& filename,
+               vector<vector<int>>& adj,
+               vector<vector<char>>& adjMat) {
     ifstream infile(filename);
     if (!infile.is_open()) {
-        cerr << "cannot open file '" << filename << "'\n";
+        cerr << "Error: cannot open file '" << filename << "'\n";
         exit(1);
     }
 
-    unordered_map<string, int> nodeToId;
-    vector<pair<int, int>> edges;
-    string line, ustr, vstr;
-    int nextId = 0;
+    vector<pair<int, int>> edgess;
+    string line;
+    int u, v;
+    int mx = -1;
 
     while (getline(infile, line)) {
         istringstream iss(line);
-        if (!(iss >> ustr >> vstr)) continue;
+        if (!(iss >> u >> v)) continue;
 
-        if (!nodeToId.count(ustr)) nodeToId[ustr] = nextId++;
-        if (!nodeToId.count(vstr)) nodeToId[vstr] = nextId++;
-
-        int u = nodeToId[ustr];
-        int v = nodeToId[vstr];
-        edges.emplace_back(u, v);
+        edgess.emplace_back(u, v);
+        mx = max(mx, max(u, v));
     }
 
-    adj.assign(nextId, {});
-    adjMat.assign(nextId, vector<char>(nextId, 0));
+    int n = mx + 1;
 
-    for (auto [u, v] : edges) {
+    adj.assign(n, {});
+    adjMat.assign(n, vector<char>(n, 0));
+
+    for (auto [u, v] : edgess) {
         adj[u].push_back(v);
         adj[v].push_back(u);
         adjMat[u][v] = adjMat[v][u] = 1;
     }
 }
-
 ld rmsewc(vector<vector<int>> adj, vector<ld> x, ld evl) {
 	int n = adj.size();
 	vector<ld> y(n);
@@ -596,7 +638,7 @@ pair<ld, vector<ld>> evlevc(vector<vector<int>> adj) {
         norm = sqrt(norm);
 
         if (norm < EPS) {
-            cerr << "Zero vector\n";
+            cerr << "Zero vector encountered.\n";
             return {0, x};
         }
 
@@ -619,7 +661,7 @@ pair<ld, vector<ld>> evlevc(vector<vector<int>> adj) {
 }
 
 vector<ld> matchsortld(vector<ld> a, vector<ld> b) {
-    int n = a.size();
+    int n = b.size();
 
     sort(a.begin(), a.end());
 
@@ -640,7 +682,7 @@ vector<ld> matchsortld(vector<ld> a, vector<ld> b) {
 
 
 vector<int> matchsortint(vector<int> a, vector<int> b) {
-    int n = a.size();
+    int n = b.size();
 
     sort(a.begin(), a.end());
 
@@ -659,10 +701,39 @@ vector<int> matchsortint(vector<int> a, vector<int> b) {
     return res;
 }
 
+vector<int> readGoodNodes(int k) {
+    ifstream infile("data_middle1.txt");
+    if (!infile.is_open()) {
+        cerr << "Error: cannot open file data_middle.txt \n";
+        exit(1);
+    }
+
+    vector<int> goodnodes;
+
+    for (int i = 0; ; i++) {
+        int a[15];
+
+        bool ok = true;
+        for (int j = 0; j < 15; j++) {
+            if (!(infile >> a[j])) {
+                ok = false;
+                break;
+            }
+        }
+
+        if (!ok) break;
+
+        if (a[k] > 0) {
+            goodnodes.push_back(i);
+        }
+    }
+
+    return goodnodes;
+}
 
 int main(int argc, char* argv[]) {
-    if (argc < 8) {
-        cerr << "Usage: " << argv[0] << " <target_file> <synth_file> <num_samples> <num_samples2> <mode> <mode2> <evbound> <degbound>\n";
+    if (argc < 9) {
+        cerr << "Usage: " << argv[0] << " <target_file> <synth_file> <num_samples> <num_samples2> <mode> <mode2> <evbound> <degbound> <hdgbound>\n";
         return 1;
     }
 	vector<vector<char>> bvv, bvvt;
@@ -675,6 +746,7 @@ int main(int argc, char* argv[]) {
 	int m2 = stoi(argv[6]);
 	ld evbound = stod(argv[7]);
 	int degbound = stoi(argv[8]);
+	int hdgbound = stoi(argv[9]);
 
 	auto [evlt, evct] = evlevc(adjt);
 	auto [evl, evc] = evlevc(adj);
@@ -686,10 +758,12 @@ int main(int argc, char* argv[]) {
 		degt[i] = adjt[i].size();
 	}
 
+	vector<int> gdnd = readGoodNodes(14);
+	//cerr << gdnd.size() << endl;
 	vector<ld> evcb = matchsortld(evct, evc);
 	vector<int> degb = matchsortint(degt, deg);
 
-    sample_edge_prob(adj, bvv, num_samples, num_samples2, m, m2, evcb, evlt, evbound, degb, degbound);
+    sample_edge_prob(adj, bvv, num_samples, num_samples2, m, m2, evcb, evlt, evbound, degb, degbound, gdnd, hdgbound);
 
     for(int u = 0; u < adj.size(); u++){
         for(int v : adj[u]){
