@@ -14,3 +14,5 @@ or
 ```bash
 ./rpll.sh <target> <output> <synth_base> <rounds>
 ```
+
+Edit `weights4.txt` first and then use `rpll.sh` with at most 24 rounds.
