@@ -2,9 +2,9 @@
 
 rm -f baseline_val_*.txt outinp_val_*.txt synth1_*.txt \
       outinp_l_val_*.txt suminp_val_*.txt bext_val_*.txt \
-	  inp1l_*.txt synth_base_*.txt tmp_round*.txt
+	  inp1l_*.txt synth_base_*.txt tmp_round*.txt PIS*.txt
 rm -f round_results.tmp inp.txt inpl.txt vecBS*.txt vecOutty.txt trfBS.txt target_c.txt smth.txt bres.tmp \
-	  out_inplxzx.txt data1.txt data_middle.txt vecInS.txt vecTar.txt bextxzx.txt suminpxzx.txt data_middle1.txt
+	  out_inplxzx.txt data1.txt data_middle.txt vecInS.txt vecTar.txt bextxzx.txt suminpxzx.txt data_middle1.txt idk.txt
 rm -rf baseline .generate_outinp_* .run_round.*
 
 set -e
@@ -1001,7 +1001,7 @@ echo
 echo "Final output stored in $FINAL"
 rm -f baseline_val_*.txt outinp_val_*.txt synth1_*.txt \
       outinp_l_val_*.txt suminp_val_*.txt bext_val_*.txt \
-	  inp1l_*.txt synth_base_*.txt tmp_round*.txt
+	  inp1l_*.txt synth_base_*.txt tmp_round*.txt PIS*.txt
 rm -f round_results.tmp inp.txt inpl.txt vecBS*.txt vecOutty.txt trfBS.txt target_c.txt smth.txt bres.tmp \
-	  out_inplxzx.txt data1.txt data_middle.txt vecInS.txt vecTar.txt bextxzx.txt suminpxzx.txt data_middle1.txt
+	  out_inplxzx.txt data1.txt data_middle.txt vecInS.txt vecTar.txt bextxzx.txt suminpxzx.txt data_middle1.txt idk.txt
 rm -rf baseline .generate_outinp_* .run_round.

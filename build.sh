@@ -7,4 +7,7 @@ g++ bxk4f.cpp -o bxk4f
 g++ bxk4one.cpp -o bxk4one
 g++ otb.cpp -o otb2
 g++ orca.cpp -o orca
+g++ evs.cpp -o evs
+g++ evc1.cpp -o evc1
+g++ evc2.cpp -o evc2
 chmod +x rpll.sh
