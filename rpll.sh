@@ -415,9 +415,9 @@ apply_exp() {
     local OUTPUT_FILE="$4"
 
 	if [ "${ec[$VAL]}" -eq 0 ]; then
-	    SCALE=$((SCALE / 600))
+	    SCALE=$((SCALE / 60))
 	else
-	    SCALE=$((SCALE / 6000))
+	    SCALE=$((SCALE / 600))
 	fi
 
 	if [ "$SCALE" -lt 1 ]; then
@@ -440,9 +440,9 @@ apply_exp2() {
     local OUTPUT_FILE="$6"
 
 	if [ "${ec[$VAL2]}" -eq 0 ]; then
-	    SCALE2=$((SCALE2 / 600))
+	    SCALE2=$((SCALE2 / 60))
 	else
-	    SCALE2=$((SCALE2 / 6000))
+	    SCALE2=$((SCALE2 / 600))
 	fi
 
 	if [ "$SCALE2" -lt 1 ]; then
