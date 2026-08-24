@@ -9,58 +9,167 @@ rm -rf baseline .generate_outinp_* .run_round.*
 
 set -e
 
+# Node-dependent work is calibrated to a 1,000-node graph.  EFFECTIVE_N is
+# clamped so small graphs still get enough trials for stable estimates while
+# large graphs cannot make every candidate evaluation arbitrarily expensive.
+REFERENCE_N=1000
+MIN_EFFECTIVE_N=500
+MAX_EFFECTIVE_N=5000
+MAX_APPLY_SAMPLES=100000
+
+clamp_int() {
+    local VALUE="$1"
+    local LOWER="$2"
+    local UPPER="$3"
+
+    if (( VALUE < LOWER )); then VALUE="$LOWER"; fi
+    if (( VALUE > UPPER )); then VALUE="$UPPER"; fi
+    printf '%d\n' "$VALUE"
+}
+
+# cleanup renumbers the largest connected component as 0,1,...,n-1, which is
+# also exactly how expfy determines n (maximum endpoint plus one).
+graph_node_count() {
+    awk '
+        NF >= 2 {
+            if ($1 !~ /^[0-9]+$/ || $2 !~ /^[0-9]+$/) bad = 1
+            u = $1 + 0
+            v = $2 + 0
+            if (!seen || u > largest) largest = u
+            if (!seen || v > largest) largest = v
+            seen = 1
+        }
+        END {
+            if (bad || !seen) exit 1
+            print largest + 1
+        }
+    ' "$1"
+}
+
+scale_from_reference() {
+    local BASE="$1"
+    # Add half the denominator so integer arithmetic rounds instead of floors.
+    printf '%d\n' $(( (BASE * EFFECTIVE_N + REFERENCE_N / 2) / REFERENCE_N ))
+}
+
+float_below_by() {
+    awk -v A="$1" -v B="$2" -v D="$3" 'BEGIN { exit !(A < B - D) }'
+}
+
+float_above_by() {
+    awk -v A="$1" -v B="$2" -v D="$3" 'BEGIN { exit !(A > B + D) }'
+}
+
+configure_node_scaled_parameters() {
+    if ! NODE_COUNT=$(graph_node_count "$TARGET"); then
+        echo "Could not determine the node count from $TARGET." >&2
+        exit 1
+    fi
+    if (( NODE_COUNT < 4 )); then
+        echo "The cleaned target must contain at least 4 nodes." >&2
+        exit 1
+    fi
+
+    EFFECTIVE_N=$(clamp_int "$NODE_COUNT" "$MIN_EFFECTIVE_N" "$MAX_EFFECTIVE_N")
+
+    # Initial synthesis passes.  These are direct expfy success targets, so
+    # they scale with n.  The first, unusually heavy pass gets an extra cap.
+    INIT_PRIMARY_SAMPLES=$(clamp_int "$(scale_from_reference 50000)" 10000 100000)
+    INIT_MAIN_SAMPLES=$(clamp_int "$(scale_from_reference 10000)" 2500 50000)
+    INIT_SECONDARY_SAMPLES=$(clamp_int "$(scale_from_reference 1000)" 250 5000)
+
+    # Preliminary eigenvector rewiring and the per-round EVC probes.
+    PIS1_SAMPLES=$(scale_from_reference 3000)
+    PIS2_SAMPLES=$(scale_from_reference 1000)
+    PIS3_SAMPLES=$(scale_from_reference 400)
+    OUTPEV_SMALL_SAMPLES=$(scale_from_reference 100)
+    OUTPEV_LARGE_SAMPLES=$(scale_from_reference 200)
+
+    # hdgb is an absolute count tolerance in a degree-histogram bin, so it
+    # should scale with node count.  evb is dimensionless and degb is a
+    # per-node degree difference, so neither is scaled merely because n grows.
+    INIT_HDGB_1=$(scale_from_reference 50)
+    INIT_HDGB_2=$(scale_from_reference 40)
+    INIT_HDGB_3=$(scale_from_reference 30)
+    INIT_HDGB_4=$(scale_from_reference 26)
+    INIT_HDGB_5=$(scale_from_reference 24)
+    INIT_HDGB_6=$(scale_from_reference 23)
+    INIT_HDGB_7=$(scale_from_reference 22)
+    ROUND_HDGB_INITIAL=$(scale_from_reference 10)
+    ROUND_HDGB_3=$(scale_from_reference 7)
+    ROUND_HDGB_7=$(scale_from_reference 85)
+    ROUND_HDGB_11=$(scale_from_reference 80)
+    ROUND_HDGB_15=$(scale_from_reference 75)
+    ROUND_HDGB_23=$(scale_from_reference 70)
+
+    echo "Graph size: $NODE_COUNT nodes (workload scaling uses $EFFECTIVE_N; clamp $MIN_EFFECTIVE_N..$MAX_EFFECTIVE_N)."
+    echo "PIS samples: $PIS1_SAMPLES, $PIS2_SAMPLES, $PIS3_SAMPLES; outpev samples: $OUTPEV_SMALL_SAMPLES, $OUTPEV_LARGE_SAMPLES."
+}
+
 if [ $# -eq 3 ]; then
-	TARGET0="$1"
-	FINAL="$2"
-	ROUNDS="$3"
-	TARGET="target_c.txt"
-
-	./cleanup "$TARGET0" "$TARGET"
-	./gen_deg2 "$TARGET" synth_base_1.txt
-
-	./bnb 4 synth_base_1.txt > bres.tmp
-	cat data_middle.txt > data_middle1.txt
-	./expfy "$TARGET" synth_base_1.txt 50000 50000 1 8 2.0 20 50 > synth_base_2.txt
-	./bnb 4 synth_base_2.txt > bres.tmp
-	cat data_middle.txt > data_middle1.txt
-	./expfy "$TARGET" synth_base_2.txt 10000 10000 1 8 1.7 18 40 > synth_base_3.txt
-	./bnb 4 synth_base_3.txt > bres.tmp
-	cat data_middle.txt > data_middle1.txt
-	./expfy "$TARGET" synth_base_3.txt 10000 10000 1 8 1.5 18 30 > synth_base_4.txt
-	./bnb 4 synth_base_4.txt > bres.tmp
-	cat data_middle.txt > data_middle1.txt
-	./expfy "$TARGET" synth_base_4.txt 10000 10000 1 8 1.3 17 26 > synth_base_5.txt
-	./bnb 4 synth_base_5.txt > bres.tmp
-	cat data_middle.txt > data_middle1.txt
-	./expfy "$TARGET" synth_base_5.txt 10000 1000 1 17 1.2 16 24 > synth_base_6.txt
-	./bnb 4 synth_base_6.txt > bres.tmp
-	cat data_middle.txt > data_middle1.txt
-	./expfy "$TARGET" synth_base_6.txt 10000 1000 1 17 1.1 15 23 > synth_base_7.txt
-	./bnb 4 synth_base_7.txt > bres.tmp
-	cat data_middle.txt > data_middle1.txt
-	./expfy "$TARGET" synth_base_7.txt 10000 1000 1 17 1 14 22 > synth_base_8.txt
-
-	PRE_INIT_SYNTH=synth_base_8.txt
+    TARGET0="$1"
+    FINAL="$2"
+    ROUNDS="$3"
+    PRE_INIT_SYNTH=""
 elif [ $# -eq 4 ]; then
-	TARGET0="$1"
-	FINAL="$2"
-	PRE_INIT_SYNTH="$3"
-	ROUNDS="$4"
-	TARGET="target_c.txt"
-	./cleanup "$TARGET0" "$TARGET"
+    TARGET0="$1"
+    FINAL="$2"
+    PRE_INIT_SYNTH="$3"
+    ROUNDS="$4"
 else
     echo "Usage: $0 <Target> <Output> <Rounds> | $0 <Target> <Output> <Base_Synth> <Rounds>"
     exit 1
+fi
+
+TARGET="target_c.txt"
+./cleanup "$TARGET0" "$TARGET"
+configure_node_scaled_parameters
+
+if [ $# -eq 3 ]; then
+    ./gen_deg2 "$TARGET" synth_base_1.txt
+
+    ./bnb 4 synth_base_1.txt > bres.tmp
+    cat data_middle.txt > data_middle1.txt
+    ./expfy "$TARGET" synth_base_1.txt "$INIT_PRIMARY_SAMPLES" "$INIT_PRIMARY_SAMPLES" 1 8 2.0 20 "$INIT_HDGB_1" > synth_base_2.txt
+    ./bnb 4 synth_base_2.txt > bres.tmp
+    cat data_middle.txt > data_middle1.txt
+    ./expfy "$TARGET" synth_base_2.txt "$INIT_MAIN_SAMPLES" "$INIT_MAIN_SAMPLES" 1 8 1.7 18 "$INIT_HDGB_2" > synth_base_3.txt
+    ./bnb 4 synth_base_3.txt > bres.tmp
+    cat data_middle.txt > data_middle1.txt
+    ./expfy "$TARGET" synth_base_3.txt "$INIT_MAIN_SAMPLES" "$INIT_MAIN_SAMPLES" 1 8 1.5 18 "$INIT_HDGB_3" > synth_base_4.txt
+    ./bnb 4 synth_base_4.txt > bres.tmp
+    cat data_middle.txt > data_middle1.txt
+    ./expfy "$TARGET" synth_base_4.txt "$INIT_MAIN_SAMPLES" "$INIT_MAIN_SAMPLES" 1 8 1.3 17 "$INIT_HDGB_4" > synth_base_5.txt
+    ./bnb 4 synth_base_5.txt > bres.tmp
+    cat data_middle.txt > data_middle1.txt
+    ./expfy "$TARGET" synth_base_5.txt "$INIT_MAIN_SAMPLES" "$INIT_SECONDARY_SAMPLES" 1 17 1.2 16 "$INIT_HDGB_5" > synth_base_6.txt
+    ./bnb 4 synth_base_6.txt > bres.tmp
+    cat data_middle.txt > data_middle1.txt
+    ./expfy "$TARGET" synth_base_6.txt "$INIT_MAIN_SAMPLES" "$INIT_SECONDARY_SAMPLES" 1 17 1.1 15 "$INIT_HDGB_6" > synth_base_7.txt
+    ./bnb 4 synth_base_7.txt > bres.tmp
+    cat data_middle.txt > data_middle1.txt
+    ./expfy "$TARGET" synth_base_7.txt "$INIT_MAIN_SAMPLES" "$INIT_SECONDARY_SAMPLES" 1 17 1 14 "$INIT_HDGB_7" > synth_base_8.txt
+
+    PRE_INIT_SYNTH=synth_base_8.txt
+else
+    if ! SYNTH_NODE_COUNT=$(graph_node_count "$PRE_INIT_SYNTH"); then
+        echo "Could not determine the node count from $PRE_INIT_SYNTH." >&2
+        exit 1
+    fi
+    if (( SYNTH_NODE_COUNT != NODE_COUNT )); then
+        echo "Target has $NODE_COUNT nodes but base synth has $SYNTH_NODE_COUNT; expfy requires equal node counts." >&2
+        exit 1
+    fi
 fi
 
 ./evs "$PRE_INIT_SYNTH" > evh.txt
 read EV1 < evh.txt
 ./evs "$TARGET" > evh.txt
 read EV2 < evh.txt
-if [ "$(echo "$EV1 < $EV2 - 14" | bc -l)" -eq 1 ]; then
-	./evc1 "$PRE_INIT_SYNTH" 3000 > PIS1.txt
-elif [ "$(echo "$EV1 > $EV2 + 14" | bc -l)" -eq 1 ]; then
-	./evc2 "$PRE_INIT_SYNTH" 3000 > PIS1.txt
+if float_below_by "$EV1" "$EV2" 14; then
+	./evc1 "$PRE_INIT_SYNTH" "$PIS1_SAMPLES" > PIS1.txt
+elif float_above_by "$EV1" "$EV2" 14; then
+	./evc2 "$PRE_INIT_SYNTH" "$PIS1_SAMPLES" > PIS1.txt
 else
 	cp "$PRE_INIT_SYNTH" PIS1.txt
 fi
@@ -69,10 +178,10 @@ fi
 read EV1 < evh.txt
 ./evs "$TARGET" > evh.txt
 read EV2 < evh.txt
-if [ "$(echo "$EV1 < $EV2 - 7" | bc -l)" -eq 1 ]; then
-	./evc1 PIS1.txt 1000 > PIS2.txt
-elif [ "$(echo "$EV1 > $EV2 + 7" | bc -l)" -eq 1 ]; then
-	./evc2 PIS1.txt 1000 > PIS2.txt
+if float_below_by "$EV1" "$EV2" 7; then
+	./evc1 PIS1.txt "$PIS2_SAMPLES" > PIS2.txt
+elif float_above_by "$EV1" "$EV2" 7; then
+	./evc2 PIS1.txt "$PIS2_SAMPLES" > PIS2.txt
 else
     cp PIS1.txt PIS2.txt
 fi
@@ -81,10 +190,10 @@ fi
 read EV1 < evh.txt
 ./evs "$TARGET" > evh.txt
 read EV2 < evh.txt
-if [ "$(echo "$EV1 < $EV2 - 2" | bc -l)" -eq 1 ]; then
-	./evc1 PIS2.txt 400 > PIS3.txt
-elif [ "$(echo "$EV1 > $EV2 + 2" | bc -l)" -eq 1 ]; then
-	./evc2 PIS2.txt 400 > PIS3.txt
+if float_below_by "$EV1" "$EV2" 2; then
+	./evc1 PIS2.txt "$PIS3_SAMPLES" > PIS3.txt
+elif float_above_by "$EV1" "$EV2" 2; then
+	./evc2 PIS2.txt "$PIS3_SAMPLES" > PIS3.txt
 else
 	cp PIS2.txt PIS3.txt
 fi
@@ -93,7 +202,7 @@ INIT_SYNTH=PIS3.txt
 
 evb=0.7
 degb=5
-hdgb=10
+hdgb="$ROUND_HDGB_INITIAL"
 CANDS=($(seq 1 60 | grep -v -E '^(25|26)$'))
 ACTIVE_CANDS=("${CANDS[@]}")
 
@@ -407,6 +516,33 @@ refresh_rare_graphlets() {
     fi
 }
 
+# Convert the magnitude used by bxk4f (calibrated at 1,000 nodes) to an
+# expfy success target.  For ec==0 this is
+#
+#     requested * EFFECTIVE_N / (1000 * 600),
+#
+# exactly the n/1000 * 1/600 rule.  Transformations with nonzero ec retain the
+# old ten-to-one reduction because each success also changes the edge count.
+scale_apply_samples() {
+    local REQUESTED="$1"
+    local DIVISOR="$2"
+    local DENOMINATOR
+    local SCALED
+
+    if (( REQUESTED <= 0 )); then
+        printf '0\n'
+        return
+    fi
+
+    DENOMINATOR=$(( REFERENCE_N * DIVISOR ))
+    SCALED=$(( (REQUESTED * EFFECTIVE_N + DENOMINATOR / 2) / DENOMINATOR ))
+
+    # A positive optimizer request must perform at least one modification, but
+    # an extreme magnitude must not turn a single candidate into an unbounded
+    # run.  expfy also has its own 20-second safety limit.
+    clamp_int "$SCALED" 1 "$MAX_APPLY_SAMPLES"
+}
+
 # Apply expfy with one type
 apply_exp() {
     local INPUT_FILE="$1"
@@ -415,13 +551,9 @@ apply_exp() {
     local OUTPUT_FILE="$4"
 
 	if [ "${ec[$VAL]}" -eq 0 ]; then
-	    SCALE=$((SCALE / 60))
+	    SCALE=$(scale_apply_samples "$SCALE" 600)
 	else
-	    SCALE=$((SCALE / 600))
-	fi
-
-	if [ "$SCALE" -lt 1 ]; then
-	    SCALE=0
+	    SCALE=$(scale_apply_samples "$SCALE" 6000)
 	fi
 
     if [ "$VAL" -ne 25 ] && [ "$VAL" -ne 26 ]; then
@@ -440,23 +572,15 @@ apply_exp2() {
     local OUTPUT_FILE="$6"
 
 	if [ "${ec[$VAL2]}" -eq 0 ]; then
-	    SCALE2=$((SCALE2 / 60))
+	    SCALE2=$(scale_apply_samples "$SCALE2" 600)
 	else
-	    SCALE2=$((SCALE2 / 600))
-	fi
-
-	if [ "$SCALE2" -lt 1 ]; then
-	    SCALE2=0
+	    SCALE2=$(scale_apply_samples "$SCALE2" 6000)
 	fi
 
 	if [ "${ec[$VAL]}" -eq 0 ]; then
-	    SCALE=$((SCALE / 60))
+	    SCALE=$(scale_apply_samples "$SCALE" 600)
 	else
-	    SCALE=$((SCALE / 600))
-	fi
-
-	if [ "$SCALE" -lt 1 ]; then
-	    SCALE=0
+	    SCALE=$(scale_apply_samples "$SCALE" 6000)
 	fi
 
     if [ "$VAL" -ne 25 ] && [ "$VAL" -ne 26 ]; then
@@ -523,7 +647,10 @@ run_round() {
 
         local -a EVC_LABELS=(outpev11 outpev12 outpev21 outpev22)
         local -a EVC_TOOLS=(evc1 evc1 evc2 evc2)
-        local -a EVC_AMOUNTS=(100 200 100 200)
+        local -a EVC_AMOUNTS=(
+            "$OUTPEV_SMALL_SAMPLES" "$OUTPEV_LARGE_SAMPLES"
+            "$OUTPEV_SMALL_SAMPLES" "$OUTPEV_LARGE_SAMPLES"
+        )
         local -a EVC_PIDS=()
         local EVC_FAILED=0
         local IDX LABEL TOOL AMOUNT PID
@@ -961,27 +1088,27 @@ for ((i=1; i<=ROUNDS; i++)); do
     if (( i == 3 )); then
         evb=0.6
 		degb=3
-		hdgb=7
+		hdgb="$ROUND_HDGB_3"
     fi
     if (( i == 7 )); then
         evb=1
 		degb=17
-		hdgb=85
+		hdgb="$ROUND_HDGB_7"
     fi
     if (( i == 11 )); then
         evb=0.9
 		degb=16
-		hdgb=80
+		hdgb="$ROUND_HDGB_11"
     fi
     if (( i == 15 )); then
         evb=0.7
 		degb=15
-		hdgb=75
+		hdgb="$ROUND_HDGB_15"
     fi
     if (( i == 23 )); then
         evb=0.5
 		degb=14
-		hdgb=70
+		hdgb="$ROUND_HDGB_23"
     fi
 
     if (( (i-1) % 4 == 0 )); then
@@ -1004,4 +1131,4 @@ rm -f baseline_val_*.txt outinp_val_*.txt synth1_*.txt \
 	  inp1l_*.txt synth_base_*.txt tmp_round*.txt PIS*.txt
 rm -f round_results.tmp inp.txt inpl.txt vecBS*.txt vecOutty.txt trfBS.txt target_c.txt smth.txt bres.tmp \
 	  out_inplxzx.txt data1.txt data_middle.txt vecInS.txt vecTar.txt bextxzx.txt suminpxzx.txt data_middle1.txt idk.txt
-rm -rf baseline .generate_outinp_* .run_round.
+rm -rf baseline .generate_outinp_* .run_round.*
