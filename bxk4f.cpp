@@ -1,205 +1,271 @@
 #include <bits/stdc++.h>
 using namespace std;
 
-using Vec6 = array<double,6>;
+using Vec6 = array<double, 6>;
 
-vector<int> wes;
+namespace {
 
-Vec6 add(const Vec6& a, const Vec6& b){
-    Vec6 r;
-    for(int i=0;i<6;i++) r[i]=a[i]+b[i];
-    return r;
-}
+constexpr double EPS = 1e-12;
+vector<int> weights;
 
-Vec6 mul(const Vec6& a, double k){
-    Vec6 r;
-    for(int i=0;i<6;i++) r[i]=a[i]*k;
-    return r;
-}
+struct Curve {
+    double ka = 0.0;
+    double kb = 0.0;
+    Vec6 A{};
+    Vec6 B{};
+};
 
-Vec6 lerp(const Vec6& P, const Vec6& Q, double u){
-    Vec6 R;
-    for(int i=0;i<6;i++)
-        R[i] = (1-u)*P[i] + u*Q[i];
-    return R;
-}
-
-//////////////////////////////////////////////////////
-// Piecewise displacement
-//////////////////////////////////////////////////////
-
-Vec6 displacement(
-    double x,
-    double ka, double kb,
-    const Vec6& A,
-    const Vec6& B
-){
-    Vec6 O{}; // zero vector
-
-    if(x <= ka){
-        double u = (ka==0 ? 0 : x/ka);
-        return lerp(O, A, u);
+Vec6 lerp(const Vec6& p, const Vec6& q, double u) {
+    Vec6 result{};
+    for (int i = 0; i < 6; ++i) {
+        result[i] = (1.0 - u) * p[i] + u * q[i];
     }
-    else {
-        double u = (x - ka)/(kb - ka);
-        return lerp(A, B, u);
+    return result;
+}
+
+Vec6 average(const Vec6& a, const Vec6& b) {
+    Vec6 result{};
+    for (int i = 0; i < 6; ++i) {
+        result[i] = 0.5 * (a[i] + b[i]);
     }
+    return result;
 }
 
-//////////////////////////////////////////////////////
-// Error function
-//////////////////////////////////////////////////////
+Curve normalize_curve(Curve curve) {
+    curve.ka = max(0.0, curve.ka);
+    curve.kb = max(0.0, curve.kb);
 
-vector<double> build_grid(double kb){
-    vector<double> xs;
-
-    for(double x=0; x<=600; x+=24)
-        xs.push_back(x);
-
-    for(double x=600; x<=6000; x+=240)
-        xs.push_back(x);
-
-    for(double x=6000; x<=60000; x+=2400)
-        xs.push_back(x);
-
-    for(double x=60000; x<=kb*10; x+=12000)
-        xs.push_back(x);
-
-    return xs;
-}
-
-double F6_piece(
-    const Vec6& target,
-    const Vec6& initial,
-    double x,
-    double y,
-    double ka, double kb,
-    const Vec6& A,
-    const Vec6& B,
-    const Vec6& A2,
-    const Vec6& B2
-){
-    Vec6 v = displacement(x, ka, kb, A, B);
-    Vec6 v2 = displacement(y, ka, kb, A2, B2);
-
-    double sum = 0;
-    for(int i=0;i<6;i++){
-        double val = initial[i] - v[i] - v2[i];
-		double d = val - target[i];
-		sum += wes[i]*(d*d);
+    // A heavily constrained 300000-scale probe can occasionally complete fewer
+    // changes than the 30000-scale probe.  Keep each displacement attached to
+    // the scale that actually produced it, then put the two observations in
+    // increasing-scale order.
+    if (curve.kb < curve.ka) {
+        swap(curve.ka, curve.kb);
+        swap(curve.A, curve.B);
     }
 
+    // If integer rounding maps both probes to the same effective scale, use one
+    // averaged observation rather than dividing by kb-ka == 0.
+    if (curve.ka > 0.0 && abs(curve.kb - curve.ka) <= EPS) {
+        curve.A = average(curve.A, curve.B);
+        curve.B = curve.A;
+    }
+
+    return curve;
+}
+
+Vec6 displacement(double x, const Curve& curve) {
+    const Vec6 zero{};
+    if (x <= 0.0 || curve.kb <= 0.0) {
+        return zero;
+    }
+
+    if (curve.ka <= 0.0) {
+        // With zero completed samples A should itself be zero.  Use the first
+        // nonzero observation B as a line through the origin.
+        return lerp(zero, curve.B, x / curve.kb);
+    }
+
+    if (x <= curve.ka) {
+        return lerp(zero, curve.A, x / curve.ka);
+    }
+
+    if (curve.kb - curve.ka <= EPS) {
+        return lerp(zero, curve.A, x / curve.ka);
+    }
+
+    // u > 1 deliberately extrapolates beyond the larger tested scale, matching
+    // the behavior of the previous fixed-30000/300000 implementation.
+    const double u = (x - curve.ka) / (curve.kb - curve.ka);
+    return lerp(curve.A, curve.B, u);
+}
+
+void add_range(vector<double>& grid, double first, double last, double step) {
+    if (step <= 0.0 || last < first) return;
+    for (double x = first; x <= last + EPS; x += step) {
+        grid.push_back(x);
+    }
+}
+
+vector<double> build_grid(const Curve& first, const Curve& second) {
+    vector<double> grid;
+
+    const double upper =
+        2.0 * min(max(first.ka, first.kb),
+                  max(second.ka, second.kb));
+
+    add_range(grid, 0.0, 600.0, 24.0);
+    add_range(grid, 600.0, 6000.0, 240.0);
+    add_range(grid, 6000.0, 60000.0, 2400.0);
+
+    if (upper > 60000.0) {
+        add_range(grid, 60000.0, upper, 12000.0);
+    }
+
+    // Include the actual probe scales explicitly.
+    grid.push_back(first.ka);
+    grid.push_back(first.kb);
+    grid.push_back(second.ka);
+    grid.push_back(second.kb);
+
+    // Remove everything above the new upper bound.
+    grid.erase(remove_if(grid.begin(), grid.end(),
+                         [&](double x) {
+                             return x > upper + EPS;
+                         }),
+               grid.end());
+
+    sort(grid.begin(), grid.end());
+
+    grid.erase(unique(grid.begin(), grid.end(), [](double a, double b) {
+        return abs(a - b) <= EPS;
+    }), grid.end());
+
+    return grid;
+}
+
+double error_at(const Vec6& target,
+                const Vec6& initial,
+                double x,
+                double y,
+                const Curve& first,
+                const Curve& second) {
+    const Vec6 v1 = displacement(x, first);
+    const Vec6 v2 = displacement(y, second);
+
+    double sum = 0.0;
+    for (int i = 0; i < 6; ++i) {
+        const double predicted = initial[i] - v1[i] - v2[i];
+        const double diff = predicted - target[i];
+        sum += weights[i] * diff * diff;
+    }
     return sqrt(sum);
 }
 
-//////////////////////////////////////////////////////
-// Brute search
-//////////////////////////////////////////////////////
+struct SearchResult {
+    double x = 0.0;
+    double y = 0.0;
+    double error = numeric_limits<double>::infinity();
+};
 
-pair<pair<double,double>, double> minimize_piece(
-    const Vec6& target,
-    const Vec6& initial,
-    double ka, double kb,
-    const Vec6& A,
-    const Vec6& B,
-    const Vec6& A2,
-    const Vec6& B2,
-	const int e1,
-	const int e2
-){
-    double bestX = 0;
-    double bestY = 0;
-    double bestF = 200;
+SearchResult minimize_piece(const Vec6& target,
+                            const Vec6& initial,
+                            const Curve& first,
+                            const Curve& second,
+                            int edge_change1,
+                            int edge_change2) {
+    SearchResult best;
+    best.error = error_at(target, initial, 0.0, 0.0, first, second);
 
-	auto xs = build_grid(kb);
-	auto ys = build_grid(kb);
-	if (e1 == e2 && e1 == 0){
-		for(double x : xs){
-		    for(double y : ys){
-		        double f = F6_piece(target, initial, x, y, ka, kb, A, B, A2, B2);
+    const vector<double> grid = build_grid(first, second);
 
-		        if(f < bestF){
-		            bestF = f;
-		            bestX = x;
-					bestY = y;
-		        }
-			}
-	    }
-	}
-	else if ((e1 < 0 && e2 > 0) || (e1 > 0 && e2 < 0)){
-		for (double x : xs){
-			double y = x*(double)e1/(double)e2;
-			y = abs(y);
-            double f = F6_piece(target, initial, x, y, ka, kb, A, B, A2, B2);
-
-            if(f < bestF){
-                bestF = f;
-                bestX = x;
-                bestY = y;
+    if (edge_change1 == 0 && edge_change2 == 0) {
+        for (double x : grid) {
+            for (double y : grid) {
+                const double error = error_at(
+                    target, initial, x, y, first, second);
+                if (error < best.error) {
+                    best = {x, y, error};
+                }
             }
-		}
-	}
+        }
+    } else if ((edge_change1 < 0 && edge_change2 > 0) ||
+               (edge_change1 > 0 && edge_change2 < 0)) {
+        for (double x : grid) {
+            const double y = abs(
+                x * static_cast<double>(edge_change1) /
+                static_cast<double>(edge_change2));
+            const double error = error_at(
+                target, initial, x, y, first, second);
+            if (error < best.error) {
+                best = {x, y, error};
+            }
+        }
+    }
 
-    return {{bestX, bestY}, bestF};
+    return best;
 }
 
-//////////////////////////////////////////////////////
-// MAIN
-//////////////////////////////////////////////////////
-int main(int argc, char* argv[]) {
-    int e1 = stoi(argv[1]);
-    int e2 = stoi(argv[2]);
-    int cm = stoi(argv[3]);
+bool read_vec6(istream& input, Vec6& values) {
+    for (double& value : values) {
+        if (!(input >> value)) return false;
+    }
+    return true;
+}
 
-    ifstream file("weights4.txt");
-    if (!file) {
-        cerr << "Error: Could not open file.\n";
+}  // namespace
+
+int main(int argc, char* argv[]) {
+    if (argc != 4) {
+        cerr << "Usage: " << argv[0]
+             << " <edge_change_1> <edge_change_2> <weight_mode>\n";
+        return 1;
+    }
+
+    int edge_change1;
+    int edge_change2;
+    int weight_mode;
+    try {
+        edge_change1 = stoi(argv[1]);
+        edge_change2 = stoi(argv[2]);
+        weight_mode = stoi(argv[3]);
+    } catch (const exception&) {
+        cerr << "Error: invalid integer command-line argument.\n";
+        return 1;
+    }
+
+    ifstream weight_file("weights4.txt");
+    if (!weight_file) {
+        cerr << "Error: could not open weights4.txt.\n";
         return 1;
     }
 
     vector<vector<int>> all_weights(6, vector<int>(6));
-
-    for (int i = 0; i < 6; i++) {
-        for (int j = 0; j < 6; j++) {
-            file >> all_weights[i][j];
+    for (auto& row : all_weights) {
+        for (int& value : row) {
+            if (!(weight_file >> value)) {
+                cerr << "Error: weights4.txt must contain 36 integers.\n";
+                return 1;
+            }
         }
     }
 
-    if (cm < 0 || cm >= 6) {
-        cerr << "Error: cm out of range.\n";
+    if (weight_mode < 0 || weight_mode >= 6) {
+        cerr << "Error: weight mode is out of range.\n";
+        return 1;
+    }
+    weights = all_weights[weight_mode];
+
+    Vec6 initial{};
+    Vec6 target{};
+    Curve first;
+    Curve second;
+
+    // Input layout, produced by rpll.sh:
+    //   initial[6], target[6]
+    //   first.ka first.kb, first.A[6], first.B[6]
+    //   second.ka second.kb, second.A[6], second.B[6]
+    if (!read_vec6(cin, initial) || !read_vec6(cin, target) ||
+        !(cin >> first.ka >> first.kb) ||
+        !read_vec6(cin, first.A) || !read_vec6(cin, first.B) ||
+        !(cin >> second.ka >> second.kb) ||
+        !read_vec6(cin, second.A) || !read_vec6(cin, second.B)) {
+        cerr << "Error: incomplete bxk4f input.\n";
         return 1;
     }
 
-    wes = all_weights[cm];
+    for (int i = 0; i < 6; ++i) {
+        target[i] = target[i] > 0.0 ? log(target[i]) : -15.0;
+        initial[i] = initial[i] > 0.0 ? log(initial[i]) : -15.0;
+    }
 
-    Vec6 target, initial, A, B, C, D, A2, B2, C2, D2;
-    double ka = 30000, kb = 300000;
+    first = normalize_curve(first);
+    second = normalize_curve(second);
 
-    // target
-    for(int i=0;i<6;i++) cin >> initial[i];
-    for(int i=0;i<6;i++) cin >> target[i];
-	for(int i=0;i<6;i++){
-		if(target[i] > 0) target[i] = log(target[i]);
-		else target[i] = -15;
-		if(initial[i] > 0) initial[i] = log(initial[i]);
-		else initial[i] = -15;
-	}
+    const SearchResult best = minimize_piece(
+        target, initial, first, second, edge_change1, edge_change2);
 
-    // breakpoints
-    //cin >> ka >> kb >> kc;
-
-    // vectors
-    for(int i=0;i<6;i++) cin >> A[i];
-    for(int i=0;i<6;i++) cin >> B[i];
-    for(int i=0;i<6;i++) cin >> A2[i];
-    for(int i=0;i<6;i++) cin >> B2[i];
-
-    auto [bestXY, bestF] =
-        minimize_piece(target, initial, ka, kb, A, B, A2, B2, e1, e2);
-	auto [bestX, bestY] = bestXY;
-
-	cout << fixed << setprecision(0)
-	     << bestX << " " << bestY << " ";
-
-	cout << setprecision(10) << bestF << "\n";
+    cout << fixed << setprecision(0) << best.x << " " << best.y << " ";
+    cout << setprecision(10) << best.error << "\n";
+    return 0;
 }

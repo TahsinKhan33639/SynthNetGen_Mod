@@ -64,43 +64,60 @@ int main(int argc, char* argv[]) {
     vector<vector<int>> adj(n);
     vector<int> currDeg(n, 0);
 
-    // Build spanning tree
-    vector<int> perm(n);
-    iota(perm.begin(), perm.end(), 0);
-    shuffle(perm.begin(), perm.end(), rng);
+    // Build a spanning tree. A random ordering/choice can trap the process by
+    // saturating every currently connected node too early, so restart from a
+    // completely empty generated graph when that happens.
+    constexpr int MAX_TREE_ATTEMPTS = 50;
+    bool treeBuilt = false;
 
-    vector<int> connected;
-    connected.push_back(perm[0]);
+    for (int attempt = 1; attempt <= MAX_TREE_ATTEMPTS; attempt++) {
+        adj.assign(n, {});
+        currDeg.assign(n, 0);
 
-    vector<bool> inTree(n, false);
-    inTree[perm[0]] = true;
+        vector<int> perm(n);
+        iota(perm.begin(), perm.end(), 0);
+        shuffle(perm.begin(), perm.end(), rng);
 
-    for (int idx = 1; idx < n; idx++) {
-        int u = perm[idx];
+        vector<int> connected;
+        connected.push_back(perm[0]);
 
-        vector<int> candidates;
+        bool attemptFailed = false;
 
-        for (int v : connected) {
-            if (currDeg[v] < deg[v]) {
-                candidates.push_back(v);
+        for (int idx = 1; idx < n; idx++) {
+            int u = perm[idx];
+            vector<int> candidates;
+
+            for (int v : connected) {
+                if (currDeg[v] < deg[v]) {
+                    candidates.push_back(v);
+                }
             }
+
+            if (candidates.empty()) {
+                attemptFailed = true;
+                break;
+            }
+
+            int v = candidates[rng() % candidates.size()];
+
+            adj[u].push_back(v);
+            adj[v].push_back(u);
+
+            currDeg[u]++;
+            currDeg[v]++;
+
+            connected.push_back(u);
         }
 
-        if (candidates.empty()) {
-            cerr << "Failed to build spanning tree.\n";
-            return 1;
+        if (!attemptFailed) {
+            treeBuilt = true;
+            break;
         }
+    }
 
-        int v = candidates[rng() % candidates.size()];
-
-        adj[u].push_back(v);
-        adj[v].push_back(u);
-
-        currDeg[u]++;
-        currDeg[v]++;
-
-        connected.push_back(u);
-        inTree[u] = true;
+    if (!treeBuilt) {
+        cerr << "Too hard to build spanning tree.\n";
+        return 1;
     }
 
     // Remaining degree

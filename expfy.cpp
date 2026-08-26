@@ -5,7 +5,23 @@ using ld = double;
 const int MAX_ITERS = 10000;
 const ld EPS = 1e-12;
 
-using Clock = std::chrono::steady_clock;
+// Bound work by attempted graphlet samples rather than elapsed wall time.
+// This makes each expfy process do a comparable amount of work even when
+// several processes are competing for CPU time in parallel.
+const long long MIN_SAMPLE_ATTEMPTS = 800000;
+const long long MAX_SAMPLE_ATTEMPTS = 1000000;
+const long long ATTEMPTS_PER_REQUESTED_CHANGE = 500;
+
+// A single graphlet-sampling attempt must also be bounded internally.
+// Otherwise pick_neighbor could keep retrying forever before the outer sample
+// counter gets a chance to advance.
+const int MAX_NEIGHBOR_PICK_ATTEMPTS = 100;
+
+struct SampleStats {
+    int done1 = 0;
+    int done2 = 0;
+    long long attempts = 0;
+};
 
 unordered_map<int, int> adj6bit_to_id = {
     {0b000000, 0},
@@ -88,7 +104,7 @@ int get_graph_id(const vector<vector<int>>& adj) {
         return -1;
 }
 
-void sample_edge_prob(vector<vector<int>>& adj, vector<vector<char>>& bvv, int num_samples, int num_samples2, int m1, int m2,
+SampleStats sample_edge_prob(vector<vector<int>>& adj, vector<vector<char>>& bvv, int num_samples, int num_samples2, int m1, int m2,
 					 vector<ld> x, ld evl, ld evbound, vector<int> degb, int degbound, vector<int> gdnd, int hdgbound) {
 	vector<double> cntr(6, 0);
     int n = adj.size();
@@ -96,7 +112,7 @@ void sample_edge_prob(vector<vector<int>>& adj, vector<vector<char>>& bvv, int n
 	for (auto i : gdnd) gnif[i] = true;
     if (n < 4) {
         cerr << "Graph must have at least 4 nodes.\n";
-        return;
+        return {};
     }
     random_device rd;
     mt19937 rng(rd());
@@ -148,6 +164,7 @@ void sample_edge_prob(vector<vector<int>>& adj, vector<vector<char>>& bvv, int n
 
 	int donereps = 0;
 	int donereps2 = 0;
+	int active_slot = 1;
 	int m = m1;
 
 	int lklk1=0, lklk2=0, lklk3=0, lklk4=0;
@@ -257,8 +274,8 @@ void sample_edge_prob(vector<vector<int>>& adj, vector<vector<char>>& bvv, int n
 
         if (!open) return;
 		lklk4++;
-        if (m == m1) donereps++;
-        if (m == m2) donereps2++;
+        if (active_slot == 1 && donereps < num_samples) donereps++;
+        if (active_slot == 2 && donereps2 < num_samples2) donereps2++;
         for (auto [type, n1, n2] : ops) {
             if (type == 1) j(n1, n2);
             if (type == 2) d(n1, n2);
@@ -266,23 +283,41 @@ void sample_edge_prob(vector<vector<int>>& adj, vector<vector<char>>& bvv, int n
     };
 
 
-	auto start = Clock::now();
+	num_samples = max(0, num_samples);
+	num_samples2 = max(0, num_samples2);
 
-	num_samples = max(1, num_samples);
-	num_samples2 = max(1, num_samples2);
+	const long long requested_changes =
+	    static_cast<long long>(num_samples) + num_samples2;
+	long long max_sample_attempts = 0;
+	if (requested_changes > 0) {
+		const long long scaled_attempt_limit =
+		    requested_changes > MAX_SAMPLE_ATTEMPTS / ATTEMPTS_PER_REQUESTED_CHANGE
+		        ? MAX_SAMPLE_ATTEMPTS
+		        : requested_changes * ATTEMPTS_PER_REQUESTED_CHANGE;
+		max_sample_attempts = clamp(
+		    scaled_attempt_limit, MIN_SAMPLE_ATTEMPTS, MAX_SAMPLE_ATTEMPTS);
+	}
 
-	for (int smpl = 0; (donereps < num_samples) || (donereps2 < num_samples2); smpl++) {
+	long long smpl = 0;
+	for (; smpl < max_sample_attempts &&
+	       ((donereps < num_samples) || (donereps2 < num_samples2));
+	     ++smpl) {
 
-		if ((double)donereps / num_samples > (double)donereps2 / num_samples2 + 0.02) m = m2;
-		if ((double)donereps / num_samples < (double)donereps2 / num_samples2 - 0.02) m = m1;
+		const bool need1 = donereps < num_samples;
+		const bool need2 = donereps2 < num_samples2;
 
-		if (donereps2 == num_samples2) m = m1;
-		if (donereps == num_samples) m = m2;
-
-		auto now = Clock::now();
-		if (std::chrono::duration_cast<std::chrono::seconds>(now - start).count() >= 20) {
-        	break;
+		if (!need1) {
+			active_slot = 2;
+		} else if (!need2) {
+			active_slot = 1;
+		} else {
+			const double progress1 = static_cast<double>(donereps) / num_samples;
+			const double progress2 = static_cast<double>(donereps2) / num_samples2;
+			if (progress1 > progress2 + 0.02) active_slot = 2;
+			if (progress1 < progress2 - 0.02) active_slot = 1;
 		}
+		m = active_slot == 1 ? m1 : m2;
+
         vector<int> nodes;
 
 		uniform_int_distribution<int> dist0(0, n - 1);
@@ -290,17 +325,9 @@ void sample_edge_prob(vector<vector<int>>& adj, vector<vector<char>>& bvv, int n
 
 		int node1 = dist0(rng);
 
-		if (m == m1) {
-			while (!gnif[node1]) {
-				if (prob(rng) < 0.2) break;
-				node1 = dist0(rng);
-			}
-		}
-		if (m == m2) {
-			while (!gnif[node1]) {
-				if (prob(rng) < 0.2) break;
-				node1 = dist0(rng);
-			}
+		while (!gnif[node1]) {
+			if (prob(rng) < 0.2) break;
+			node1 = dist0(rng);
 		}
         nodes.push_back(node1);
 
@@ -311,26 +338,21 @@ void sample_edge_prob(vector<vector<int>>& adj, vector<vector<char>>& bvv, int n
 	    options.reserve(32);
 
         auto pick_neighbor = [&](const vector<int>& cds) -> int {
-            int v = nodes[0];
-            if (m == m1) {
-				while (find(cds.begin(), cds.end(), v) != cds.end()){
-	                int u = cds[rng() % cds.size()];
-	                v = adj[u][rng() % adj[u].size()];
-					if (!gnif[v]){
-						if (prob(rng) < 0.7) v = nodes[0];
-					}
-	            }
+            for (int attempt = 0; attempt < MAX_NEIGHBOR_PICK_ATTEMPTS;
+                 ++attempt) {
+                int u = cds[rng() % cds.size()];
+                if (adj[u].empty()) continue;
+
+                int v = adj[u][rng() % adj[u].size()];
+                if (find(cds.begin(), cds.end(), v) != cds.end()) continue;
+
+                // Preserve the old 70% rejection bias for nodes not listed in
+                // data_middle1.txt, but count the rejection as an attempt.
+                if (!gnif[v] && prob(rng) < 0.7) continue;
+
+                return v;
             }
-			if (m == m2) {
-				while (find(cds.begin(), cds.end(), v) != cds.end()){
-	                int u = cds[rng() % cds.size()];
-	                v = adj[u][rng() % adj[u].size()];
-					if (!gnif[v]){
-						if (prob(rng) < 0.7) v = nodes[0];
-					}
-	            }
-            }
-			return v;
+            return -1;
         };
 
         int node2 = pick_neighbor({nodes[0]});
@@ -402,7 +424,6 @@ void sample_edge_prob(vector<vector<int>>& adj, vector<vector<char>>& bvv, int n
 		}
 		if (gid == 9 && (m == 24 || m == 31 || m == 55 || (48 <= m && m <= 49))){
 			int u = -1, v = -1, w = -1, z = -1;
-			bool found = false;
 			vector<int> blanks;
 			for (int i = 0; i < 4; i++){
 				if (sub[i][0] + sub[i][1] + sub[i][2] + sub[i][3] == 2) blanks.push_back(i);
@@ -538,11 +559,18 @@ void sample_edge_prob(vector<vector<int>>& adj, vector<vector<char>>& bvv, int n
 			if (m==54 && deg[w] != 1) { op({{1,u,v}, {2,z,w}}); }
 		}
     }
-	//cerr << donereps << " " << donereps2 << endl;
+
+	if (donereps < num_samples || donereps2 < num_samples2) {
+		cerr << "Warning: sample-attempt limit reached after " << smpl
+		     << " attempts before all requested changes were completed.\n";
+	}
+
 	double sumsss = 0;
 	for (auto i : cntr) sumsss += i;
 	//for (int i = 0; i<6; i++) {cntr[i] /= sumsss; cerr << cntr[i] << " ";} cerr << sumsss << endl;
 	//cerr << lklk1 << " " << lklk2 << " " << lklk3 << " " << lklk4 << " " << endl;
+
+	return {donereps, donereps2, smpl};
 }
 
 void readGraph(const string& filename,
@@ -653,9 +681,11 @@ pair<ld, vector<ld>> evlevc(vector<vector<int>> adj) {
         x = move(y);
     }
 
-    cout << fixed << setprecision(12);
-    cout << "Largest eigenvalue (approx): " << prev_lambda << '\n';
-    cout << "Reached max iterations.\n";
+    // stdout is reserved exclusively for the generated edge list.
+    // Diagnostics must go to stderr or they become invalid lines in the graph.
+    cerr << fixed << setprecision(12);
+    cerr << "Largest eigenvalue (approx): " << prev_lambda << '\n';
+    cerr << "Reached max iterations.\n";
 
     return {prev_lambda, x};
 }
@@ -732,8 +762,11 @@ vector<int> readGoodNodes(int k) {
 }
 
 int main(int argc, char* argv[]) {
-    if (argc < 9) {
-        cerr << "Usage: " << argv[0] << " <target_file> <synth_file> <num_samples> <num_samples2> <mode> <mode2> <evbound> <degbound> <hdgbound>\n";
+    if (argc < 10) {
+        cerr << "Usage: " << argv[0]
+             << " <target_file> <synth_file> <num_samples> <num_samples2>"
+             << " <mode> <mode2> <evbound> <degbound> <hdgbound>"
+             << " [completed_samples_file]\n";
         return 1;
     }
 	vector<vector<char>> bvv, bvvt;
@@ -747,6 +780,8 @@ int main(int argc, char* argv[]) {
 	ld evbound = stod(argv[7]);
 	int degbound = stoi(argv[8]);
 	int hdgbound = stoi(argv[9]);
+	const string completed_samples_file =
+	    argc >= 11 ? argv[10] : "expfy_samples_done.tmp";
 
 	auto [evlt, evct] = evlevc(adjt);
 	auto [evl, evc] = evlevc(adj);
@@ -763,11 +798,22 @@ int main(int argc, char* argv[]) {
 	vector<ld> evcb = matchsortld(evct, evc);
 	vector<int> degb = matchsortint(degt, deg);
 
-    sample_edge_prob(adj, bvv, num_samples, num_samples2, m, m2, evcb, evlt, evbound, degb, degbound, gdnd, hdgbound);
+    const SampleStats stats = sample_edge_prob(
+        adj, bvv, num_samples, num_samples2, m, m2, evcb, evlt,
+        evbound, degb, degbound, gdnd, hdgbound);
 
-    for(int u = 0; u < adj.size(); u++){
-        for(int v : adj[u]){
-            if(u < v) cout << u << " " << v << "\n";
+    ofstream completed_out(completed_samples_file);
+    if (!completed_out) {
+        cerr << "Error: cannot write completed sample counts to '"
+             << completed_samples_file << "'.\n";
+        return 1;
+    }
+    completed_out << stats.done1 << " " << stats.done2 << "\n";
+    completed_out.close();
+
+    for (size_t u = 0; u < adj.size(); u++) {
+        for (int v : adj[u]) {
+            if (u < static_cast<size_t>(v)) cout << u << " " << v << "\n";
         }
     }
 

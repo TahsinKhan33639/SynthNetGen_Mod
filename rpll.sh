@@ -2,9 +2,10 @@
 
 rm -f baseline_val_*.txt outinp_val_*.txt synth1_*.txt \
       outinp_l_val_*.txt suminp_val_*.txt bext_val_*.txt \
-	  inp1l_*.txt synth_base_*.txt tmp_round*.txt PIS*.txt
+          inp1l_*.txt synth_base_*.txt tmp_round*.txt PIS*.txt
 rm -f round_results.tmp inp.txt inpl.txt vecBS*.txt vecOutty.txt trfBS.txt target_c.txt smth.txt bres.tmp \
-	  out_inplxzx.txt data1.txt data_middle.txt vecInS.txt vecTar.txt bextxzx.txt suminpxzx.txt data_middle1.txt idk.txt
+          out_inplxzx.txt data1.txt data_middle.txt vecInS.txt vecTar.txt bextxzx.txt suminpxzx.txt data_middle1.txt idk.txt \
+          expfy_samples_done.tmp .expfy_samples_*.tmp
 rm -rf baseline .generate_outinp_* .run_round.*
 
 set -e
@@ -16,6 +17,14 @@ REFERENCE_N=1000
 MIN_EFFECTIVE_N=500
 MAX_EFFECTIVE_N=5000
 MAX_APPLY_SAMPLES=100000
+
+# The final optimization round always uses these tightest constraints.  hdgb
+# is expressed at the 1,000-node reference size and is scaled after the target
+# graph has been cleaned and EFFECTIVE_N is known.
+TIGHTEST_EVB=0.5
+TIGHTEST_DEGB=14
+TIGHTEST_HDGB_REFERENCE=40
+ROUND_BACKWARD_FACTOR=1.25
 
 clamp_int() {
     local VALUE="$1"
@@ -95,16 +104,71 @@ configure_node_scaled_parameters() {
     INIT_HDGB_5=$(scale_from_reference 24)
     INIT_HDGB_6=$(scale_from_reference 23)
     INIT_HDGB_7=$(scale_from_reference 22)
-    ROUND_HDGB_INITIAL=$(scale_from_reference 10)
-    ROUND_HDGB_3=$(scale_from_reference 7)
-    ROUND_HDGB_7=$(scale_from_reference 85)
-    ROUND_HDGB_11=$(scale_from_reference 80)
-    ROUND_HDGB_15=$(scale_from_reference 75)
-    ROUND_HDGB_23=$(scale_from_reference 70)
+    # The last optimization round uses this value exactly.  Earlier rounds
+    # are generated backward from it by multiplying by ROUND_BACKWARD_FACTOR.
+    TIGHTEST_HDGB=$(scale_from_reference "$TIGHTEST_HDGB_REFERENCE")
 
     echo "Graph size: $NODE_COUNT nodes (workload scaling uses $EFFECTIVE_N; clamp $MIN_EFFECTIVE_N..$MAX_EFFECTIVE_N)."
     echo "PIS samples: $PIS1_SAMPLES, $PIS2_SAMPLES, $PIS3_SAMPLES; outpev samples: $OUTPEV_SMALL_SAMPLES, $OUTPEV_LARGE_SAMPLES."
 }
+
+# Build the constraint schedule backward from the final round.  For evb the
+# previous value is exactly 1.25 times the next value.  degb and hdgb are
+# positive integers, so each backward multiplication is rounded to the nearest
+# integer.  Consequently, ROUNDS=1 uses the tightest values immediately, while
+# every larger run reaches those same values on its final iteration.
+declare -a ROUND_EVB_SCHEDULE
+declare -a ROUND_DEGB_SCHEDULE
+declare -a ROUND_HDGB_SCHEDULE
+
+build_round_constraint_schedule() {
+    local ROUND_INDEX NEXT_INDEX NEXT_EVB NEXT_DEGB NEXT_HDGB
+    local PREVIOUS_EVB PREVIOUS_DEGB PREVIOUS_HDGB
+
+    ROUND_EVB_SCHEDULE=()
+    ROUND_DEGB_SCHEDULE=()
+    ROUND_HDGB_SCHEDULE=()
+
+    ROUND_EVB_SCHEDULE[$ROUNDS]="$TIGHTEST_EVB"
+    ROUND_DEGB_SCHEDULE[$ROUNDS]="$TIGHTEST_DEGB"
+    ROUND_HDGB_SCHEDULE[$ROUNDS]="$TIGHTEST_HDGB"
+
+    for ((ROUND_INDEX=ROUNDS-1; ROUND_INDEX>=1; ROUND_INDEX--)); do
+        NEXT_INDEX=$((ROUND_INDEX + 1))
+        NEXT_EVB="${ROUND_EVB_SCHEDULE[$NEXT_INDEX]}"
+        NEXT_DEGB="${ROUND_DEGB_SCHEDULE[$NEXT_INDEX]}"
+        NEXT_HDGB="${ROUND_HDGB_SCHEDULE[$NEXT_INDEX]}"
+
+        read -r PREVIOUS_EVB PREVIOUS_DEGB PREVIOUS_HDGB \
+            < <(awk \
+                -v EVB="$NEXT_EVB" \
+                -v DEGB="$NEXT_DEGB" \
+                -v HDGB="$NEXT_HDGB" \
+                -v FACTOR="$ROUND_BACKWARD_FACTOR" \
+                'BEGIN {
+                    printf "%.12g %d %d\n", \
+                           EVB * FACTOR, \
+                           int(DEGB * FACTOR + 0.5), \
+                           int(HDGB * FACTOR + 0.5)
+                }')
+
+        ROUND_EVB_SCHEDULE[$ROUND_INDEX]="$PREVIOUS_EVB"
+        ROUND_DEGB_SCHEDULE[$ROUND_INDEX]="$PREVIOUS_DEGB"
+        ROUND_HDGB_SCHEDULE[$ROUND_INDEX]="$PREVIOUS_HDGB"
+    done
+}
+
+set_round_constraints() {
+    local ROUND_INDEX="$1"
+
+    evb="${ROUND_EVB_SCHEDULE[$ROUND_INDEX]}"
+    degb="${ROUND_DEGB_SCHEDULE[$ROUND_INDEX]}"
+    hdgb="${ROUND_HDGB_SCHEDULE[$ROUND_INDEX]}"
+
+    echo "Round $ROUND_INDEX/$ROUNDS constraints: evb=$evb, degb=$degb, hdgb=$hdgb"
+}
+
+INITIAL_GRAPH_GIVEN=0
 
 if [ $# -eq 3 ]; then
     TARGET0="$1"
@@ -116,14 +180,21 @@ elif [ $# -eq 4 ]; then
     FINAL="$2"
     PRE_INIT_SYNTH="$3"
     ROUNDS="$4"
+    INITIAL_GRAPH_GIVEN=1
 else
     echo "Usage: $0 <Target> <Output> <Rounds> | $0 <Target> <Output> <Base_Synth> <Rounds>"
+    exit 1
+fi
+
+if ! [[ "$ROUNDS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Rounds must be a positive integer, not '$ROUNDS'." >&2
     exit 1
 fi
 
 TARGET="target_c.txt"
 ./cleanup "$TARGET0" "$TARGET"
 configure_node_scaled_parameters
+build_round_constraint_schedule
 
 if [ $# -eq 3 ]; then
     ./gen_deg2 "$TARGET" synth_base_1.txt
@@ -162,47 +233,159 @@ else
     fi
 fi
 
+# When a base synth was supplied by the user, each complete PIS candidate is
+# accepted only when its weighted RMSE is no greater than that of the last
+# accepted graph. PIS occurs before the optimization rounds, so it uses row 0
+# of weights4.txt, matching CMODE=0.
+PIS_TARGET_VEC="pis_target_vec.tmp"
+PIS_CURRENT_RMSE=""
+
+pis_graph_rmse() {
+    local GRAPH="$1"
+    local VEC_FILE SCORE STATUS
+
+    VEC_FILE=$(mktemp ".pis_vec.XXXXXX")
+    if ! ./bnb 4 "$GRAPH" > "$VEC_FILE"; then
+        rm -f "$VEC_FILE"
+        return 1
+    fi
+
+    SCORE=$(python3 - "$VEC_FILE" "$PIS_TARGET_VEC" f0.txt weights4.txt << 'PYEOF'
+import math
+import sys
+
+vec_path, target_path, zero_path, weights_path = sys.argv[1:5]
+
+def read_numbers(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return [float(x) for x in f.read().split()]
+
+A = read_numbers(vec_path)
+B = read_numbers(target_path)
+F0 = read_numbers(zero_path)
+
+with open(weights_path, "r", encoding="utf-8") as f:
+    first_line = f.readline()
+weights = [float(x) for x in first_line.split()]
+if not weights:
+    raise SystemExit(f"No CMODE=0 weights found in {weights_path}")
+
+displacement = []
+for a, b in zip(A, B):
+    if a <= 0 or b <= 0:
+        displacement.append(0.0)
+    else:
+        displacement.append(math.log(a) - math.log(b))
+
+n = min(len(F0), len(displacement), len(weights), 6)
+if n == 0:
+    raise SystemExit("Cannot compute weighted RMSE from empty vectors")
+
+value = sum(weights[i] * (F0[i] - displacement[i]) ** 2 for i in range(n))
+print(math.sqrt(value))
+PYEOF
+    ) || {
+        STATUS=$?
+        rm -f "$VEC_FILE"
+        return "$STATUS"
+    }
+
+    rm -f "$VEC_FILE"
+    printf '%s\n' "$SCORE"
+}
+
+accept_pis_candidate() {
+    local BEFORE="$1"
+    local CANDIDATE="$2"
+    local OUTPUT="$3"
+    local LABEL="$4"
+
+    if (( ! INITIAL_GRAPH_GIVEN )); then
+        mv "$CANDIDATE" "$OUTPUT"
+        return
+    fi
+
+    # The threshold branch can deliberately produce an exact copy. Do not
+    # re-sample the same graph and accidentally change the remembered score.
+    if cmp -s "$BEFORE" "$CANDIDATE"; then
+        mv "$CANDIDATE" "$OUTPUT"
+        echo "$LABEL made no change; weighted RMSE remains $PIS_CURRENT_RMSE."
+        return
+    fi
+
+    local CANDIDATE_RMSE
+    CANDIDATE_RMSE=$(pis_graph_rmse "$CANDIDATE")
+
+    echo "$LABEL weighted RMSE: before=$PIS_CURRENT_RMSE, candidate=$CANDIDATE_RMSE"
+
+    if awk -v NEW="$CANDIDATE_RMSE" -v OLD="$PIS_CURRENT_RMSE" \
+        'BEGIN { exit !(NEW <= OLD) }'; then
+        mv "$CANDIDATE" "$OUTPUT"
+        PIS_CURRENT_RMSE="$CANDIDATE_RMSE"
+        echo "$LABEL accepted."
+    else
+        cp "$BEFORE" "$OUTPUT"
+        rm -f "$CANDIDATE"
+        echo "$LABEL rejected; keeping the previous graph."
+    fi
+}
+
+if (( INITIAL_GRAPH_GIVEN )); then
+    ./bnb 4 "$TARGET" > "$PIS_TARGET_VEC"
+    PIS_CURRENT_RMSE=$(pis_graph_rmse "$PRE_INIT_SYNTH")
+    echo "Initial graph weighted RMSE before PIS: $PIS_CURRENT_RMSE"
+fi
+
+PIS1_CANDIDATE="PIS1_candidate.txt"
 ./evs "$PRE_INIT_SYNTH" > evh.txt
 read EV1 < evh.txt
 ./evs "$TARGET" > evh.txt
 read EV2 < evh.txt
 if float_below_by "$EV1" "$EV2" 14; then
-	./evc1 "$PRE_INIT_SYNTH" "$PIS1_SAMPLES" > PIS1.txt
+    ./evc1 "$PRE_INIT_SYNTH" "$PIS1_SAMPLES" > "$PIS1_CANDIDATE"
 elif float_above_by "$EV1" "$EV2" 14; then
-	./evc2 "$PRE_INIT_SYNTH" "$PIS1_SAMPLES" > PIS1.txt
+    ./evc2 "$PRE_INIT_SYNTH" "$PIS1_SAMPLES" > "$PIS1_CANDIDATE"
 else
-	cp "$PRE_INIT_SYNTH" PIS1.txt
+    cp "$PRE_INIT_SYNTH" "$PIS1_CANDIDATE"
 fi
+accept_pis_candidate "$PRE_INIT_SYNTH" "$PIS1_CANDIDATE" PIS1.txt PIS1
 
 ./evs PIS1.txt > evh.txt
 read EV1 < evh.txt
 ./evs "$TARGET" > evh.txt
 read EV2 < evh.txt
+PIS2_CANDIDATE="PIS2_candidate.txt"
 if float_below_by "$EV1" "$EV2" 7; then
-	./evc1 PIS1.txt "$PIS2_SAMPLES" > PIS2.txt
+    ./evc1 PIS1.txt "$PIS2_SAMPLES" > "$PIS2_CANDIDATE"
 elif float_above_by "$EV1" "$EV2" 7; then
-	./evc2 PIS1.txt "$PIS2_SAMPLES" > PIS2.txt
+    ./evc2 PIS1.txt "$PIS2_SAMPLES" > "$PIS2_CANDIDATE"
 else
-    cp PIS1.txt PIS2.txt
+    cp PIS1.txt "$PIS2_CANDIDATE"
 fi
+accept_pis_candidate PIS1.txt "$PIS2_CANDIDATE" PIS2.txt PIS2
 
 ./evs PIS2.txt > evh.txt
 read EV1 < evh.txt
 ./evs "$TARGET" > evh.txt
 read EV2 < evh.txt
+PIS3_CANDIDATE="PIS3_candidate.txt"
 if float_below_by "$EV1" "$EV2" 2; then
-	./evc1 PIS2.txt "$PIS3_SAMPLES" > PIS3.txt
+    ./evc1 PIS2.txt "$PIS3_SAMPLES" > "$PIS3_CANDIDATE"
 elif float_above_by "$EV1" "$EV2" 2; then
-	./evc2 PIS2.txt "$PIS3_SAMPLES" > PIS3.txt
+    ./evc2 PIS2.txt "$PIS3_SAMPLES" > "$PIS3_CANDIDATE"
 else
-	cp PIS2.txt PIS3.txt
+    cp PIS2.txt "$PIS3_CANDIDATE"
 fi
+accept_pis_candidate PIS2.txt "$PIS3_CANDIDATE" PIS3.txt PIS3
 
+rm -f "$PIS_TARGET_VEC"
 INIT_SYNTH=PIS3.txt
 
-evb=0.7
-degb=5
-hdgb="$ROUND_HDGB_INITIAL"
+# Initialize the globals used by apply_exp/apply_exp2.  The main loop resets
+# them from the precomputed schedule at the start of every round.
+evb="${ROUND_EVB_SCHEDULE[1]}"
+degb="${ROUND_DEGB_SCHEDULE[1]}"
+hdgb="${ROUND_HDGB_SCHEDULE[1]}"
 CANDS=($(seq 1 60 | grep -v -E '^(25|26)$'))
 ACTIVE_CANDS=("${CANDS[@]}")
 
@@ -279,7 +462,7 @@ mkdir -p "$BASELINE_DIR"
 
 # Log displacement
 displ() {
-    python3 - "$1" "$2" "$3" << 'EOF'
+    python3 - "$1" "$2" "$3" << 'EOF_PY'
 import sys, math
 
 A = list(map(float, open(sys.argv[1]).read().split()))
@@ -292,12 +475,12 @@ for a, b in zip(A, B):
     else:
         diff.append(math.log(a) - math.log(b))
 open(sys.argv[3], "w").write(" ".join(map(str, diff)) + "\n")
-EOF
+EOF_PY
 }
 
 # Linear displacement
 disp() {
-    python3 - "$1" "$2" "$3" << 'EOF'
+    python3 - "$1" "$2" "$3" << 'EOF_PY'
 import sys, math
 
 A = list(map(float, open(sys.argv[1]).read().split()))
@@ -310,7 +493,7 @@ for a, b in zip(A, B):
     else:
         diff.append(a - b)
 open(sys.argv[3], "w").write(" ".join(map(str, diff)) + "\n")
-EOF
+EOF_PY
 }
 
 
@@ -322,7 +505,7 @@ mapfile -t weights_table < weights4.txt
 rmse() {
     read -a W <<< "${weights_table[$CMODE]}"
 
-    python3 - "$1" "$2" "${W[@]}" << 'EOF'
+    python3 - "$1" "$2" "${W[@]}" << 'EOF_PY'
 import sys, math
 
 fileA, fileB, cmode = sys.argv[1], sys.argv[2], int(sys.argv[3])
@@ -337,7 +520,7 @@ n = min(len(A), len(B), 6)
 num = sum(w[i] * (A[i]-B[i])**2 for i in range(n))
 rmse = math.sqrt(num)
 print(rmse)
-EOF
+EOF_PY
 }
 
 # Create an isolated current directory for a parallel worker.  Several of the
@@ -539,53 +722,143 @@ scale_apply_samples() {
 
     # A positive optimizer request must perform at least one modification, but
     # an extreme magnitude must not turn a single candidate into an unbounded
-    # run.  expfy also has its own 20-second safety limit.
+    # run.  expfy also has its own attempted-sample limit.
     clamp_int "$SCALED" 1 "$MAX_APPLY_SAMPLES"
 }
 
-# Apply expfy with one type
-apply_exp() {
-    local INPUT_FILE="$1"
-    local SCALE="$2"
-    local VAL="$3"
-    local OUTPUT_FILE="$4"
+# Convert a completed expfy success count back into bxk4f scale units.
+# If optimizer scale X was converted to REQUESTED_SAMPLES=f(X), but expfy
+# completed only DONE_SAMPLES, the effective tested scale is
+#
+#     X * DONE_SAMPLES / f(X).
+#
+# Integer arithmetic rounds to the nearest scale unit.
+completed_scale_from_samples() {
+    local REQUESTED_SCALE="$1"
+    local REQUESTED_SAMPLES="$2"
+    local DONE_SAMPLES="$3"
 
-	if [ "${ec[$VAL]}" -eq 0 ]; then
-	    SCALE=$(scale_apply_samples "$SCALE" 600)
-	else
-	    SCALE=$(scale_apply_samples "$SCALE" 6000)
-	fi
-
-    if [ "$VAL" -ne 25 ] && [ "$VAL" -ne 26 ]; then
-        ./expfy "$TARGET" "$INPUT_FILE" "$SCALE" 0 "$VAL" 1 "$evb" "$degb" "$hdgb" > "$OUTPUT_FILE"
+    if (( REQUESTED_SCALE <= 0 || REQUESTED_SAMPLES <= 0 || DONE_SAMPLES <= 0 )); then
+        printf '0\n'
+        return
     fi
+
+    if (( DONE_SAMPLES > REQUESTED_SAMPLES )); then
+        DONE_SAMPLES="$REQUESTED_SAMPLES"
+    fi
+
+    printf '%d\n' $((
+        (REQUESTED_SCALE * DONE_SAMPLES + REQUESTED_SAMPLES / 2) /
+        REQUESTED_SAMPLES
+    ))
 }
 
+read_completed_sample_file() {
+    local SAMPLE_FILE="$1"
+    local RESULT_VAR1="$2"
+    local RESULT_VAR2="$3"
+    local VALUE1 VALUE2 EXTRA
 
-# Apply expfy with two types
+    if ! read -r VALUE1 VALUE2 EXTRA < "$SAMPLE_FILE"; then
+        echo "Could not read completed sample counts from $SAMPLE_FILE." >&2
+		cat "$SAMPLE_FILE"
+        return 1
+    fi
+
+    if ! [[ "$VALUE1" =~ ^[0-9]+$ && "$VALUE2" =~ ^[0-9]+$ ]] || [ -n "$EXTRA" ]; then
+        echo "Invalid completed sample data in $SAMPLE_FILE: expected two nonnegative integers." >&2
+        return 1
+    fi
+
+    printf -v "$RESULT_VAR1" '%s' "$VALUE1"
+    printf -v "$RESULT_VAR2" '%s' "$VALUE2"
+}
+
+# Apply expfy with one type.  The fifth argument is the name of a caller
+# variable that receives the effective scale actually completed by expfy.
+apply_exp() {
+    local INPUT_FILE="$1"
+    local REQUESTED_SCALE="$2"
+    local VAL="$3"
+    local OUTPUT_FILE="$4"
+    local TESTED_SCALE_VAR="$5"
+    local DIVISOR REQUESTED_SAMPLES SAMPLE_FILE DONE1 DONE2 TESTED_SCALE
+
+    if [ "${ec[$VAL]}" -eq 0 ]; then
+        DIVISOR=60
+    else
+        DIVISOR=600
+    fi
+    REQUESTED_SAMPLES=$(scale_apply_samples "$REQUESTED_SCALE" "$DIVISOR")
+
+    SAMPLE_FILE=$(mktemp ".expfy_samples.XXXXXX.tmp")
+    if ! ./expfy "$TARGET" "$INPUT_FILE" "$REQUESTED_SAMPLES" 0 \
+        "$VAL" 1 "$evb" "$degb" "$hdgb" "$SAMPLE_FILE" \
+        > "$OUTPUT_FILE"; then
+        rm -f "$SAMPLE_FILE" "$OUTPUT_FILE"
+        return 1
+    fi
+
+    if ! read_completed_sample_file "$SAMPLE_FILE" DONE1 DONE2; then
+        rm -f "$SAMPLE_FILE" "$OUTPUT_FILE"
+        return 1
+    fi
+    rm -f "$SAMPLE_FILE"
+
+    TESTED_SCALE=$(completed_scale_from_samples \
+        "$REQUESTED_SCALE" "$REQUESTED_SAMPLES" "$DONE1")
+    printf -v "$TESTED_SCALE_VAR" '%s' "$TESTED_SCALE"
+}
+
+# Apply expfy with two types.  The final two arguments are caller-variable
+# names that receive the two effective scales actually completed by expfy.
 apply_exp2() {
     local INPUT_FILE="$1"
-    local SCALE="$2"
-    local SCALE2="$3"
+    local REQUESTED_SCALE1="$2"
+    local REQUESTED_SCALE2="$3"
     local VAL="$4"
     local VAL2="$5"
     local OUTPUT_FILE="$6"
+    local TESTED_SCALE_VAR1="$7"
+    local TESTED_SCALE_VAR2="$8"
+    local DIVISOR1 DIVISOR2 REQUESTED_SAMPLES1 REQUESTED_SAMPLES2
+    local SAMPLE_FILE DONE1 DONE2 TESTED_SCALE1 TESTED_SCALE2
 
-	if [ "${ec[$VAL2]}" -eq 0 ]; then
-	    SCALE2=$(scale_apply_samples "$SCALE2" 600)
-	else
-	    SCALE2=$(scale_apply_samples "$SCALE2" 6000)
-	fi
-
-	if [ "${ec[$VAL]}" -eq 0 ]; then
-	    SCALE=$(scale_apply_samples "$SCALE" 600)
-	else
-	    SCALE=$(scale_apply_samples "$SCALE" 6000)
-	fi
-
-    if [ "$VAL" -ne 25 ] && [ "$VAL" -ne 26 ]; then
-        ./expfy "$TARGET" "$INPUT_FILE" "$SCALE" "$SCALE2" "$VAL" "$VAL2" "$evb" "$degb" "$hdgb" > "$OUTPUT_FILE"
+    if [ "${ec[$VAL]}" -eq 0 ]; then
+        DIVISOR1=60
+    else
+        DIVISOR1=600
     fi
+    if [ "${ec[$VAL2]}" -eq 0 ]; then
+        DIVISOR2=60
+    else
+        DIVISOR2=600
+    fi
+
+    REQUESTED_SAMPLES1=$(scale_apply_samples "$REQUESTED_SCALE1" "$DIVISOR1")
+    REQUESTED_SAMPLES2=$(scale_apply_samples "$REQUESTED_SCALE2" "$DIVISOR2")
+
+    SAMPLE_FILE=$(mktemp ".expfy_samples.XXXXXX.tmp")
+    if ! ./expfy "$TARGET" "$INPUT_FILE" \
+        "$REQUESTED_SAMPLES1" "$REQUESTED_SAMPLES2" "$VAL" "$VAL2" \
+        "$evb" "$degb" "$hdgb" "$SAMPLE_FILE" > "$OUTPUT_FILE"; then
+        rm -f "$SAMPLE_FILE" "$OUTPUT_FILE"
+        return 1
+    fi
+
+    if ! read_completed_sample_file "$SAMPLE_FILE" DONE1 DONE2; then
+        rm -f "$SAMPLE_FILE" "$OUTPUT_FILE"
+        return 1
+    fi
+    rm -f "$SAMPLE_FILE"
+
+    TESTED_SCALE1=$(completed_scale_from_samples \
+        "$REQUESTED_SCALE1" "$REQUESTED_SAMPLES1" "$DONE1")
+    TESTED_SCALE2=$(completed_scale_from_samples \
+        "$REQUESTED_SCALE2" "$REQUESTED_SAMPLES2" "$DONE2")
+
+    printf -v "$TESTED_SCALE_VAR1" '%s' "$TESTED_SCALE1"
+    printf -v "$TESTED_SCALE_VAR2" '%s' "$TESTED_SCALE2"
 }
 
 
@@ -780,7 +1053,20 @@ run_round() {
                             exit 1
                         fi
 
+                        # bxk4f input order is:
+                        #   current[6], target[6],
+                        #   first.ka first.kb first.A[6] first.B[6],
+                        #   second.ka second.kb second.A[6] second.B[6].
+                        # Each outinp file begins with its actual tested ka/kb.
                         cat "$INP" "$OUT_INP" "$OUT_INP2" > pair_input.tmp
+
+                        local PAIR_INPUT_WORDS
+                        PAIR_INPUT_WORDS=$(wc -w < pair_input.tmp)
+                        if (( PAIR_INPUT_WORDS != 40 )); then
+                            echo "Malformed bxk4f input for pair $VAL,$VAL2: expected 40 values, got $PAIR_INPUT_WORDS." >&2
+                            exit 1
+                        fi
+
                         "$BXK4F_ABS" "${ec[$VAL]}" "${ec[$VAL2]}" "$CMODE" \
                             < pair_input.tmp > pair_output.tmp
 
@@ -865,9 +1151,12 @@ run_round() {
                 local MAG_FACTOR GOT_RMSE
                 local ADJUSTED_SCALE="$SCALE"
                 local ADJUSTED_SCALE2="$SCALE2"
+                local STAGE1_TESTED_SCALE STAGE1_TESTED_SCALE2
+                local FINAL_TESTED_SCALE FINAL_TESTED_SCALE2
 
                 apply_exp2 "$INPUT_ABS" "$ADJUSTED_SCALE" "$ADJUSTED_SCALE2" \
-                    "$sorted_VAL" "$sorted_VAL2" "$STAGE1"
+                    "$sorted_VAL" "$sorted_VAL2" "$STAGE1" \
+                    STAGE1_TESTED_SCALE STAGE1_TESTED_SCALE2
 
                 ./bnb 4 "$STAGE1" > stage1.vec
                 displ "$VEC_INS" stage1.vec stage1.displ
@@ -875,21 +1164,37 @@ run_round() {
                 "$BXK4ONE_ABS" "$CMODE" < scale_input.tmp > scale_output.tmp
 
                 read -r MAG_FACTOR < scale_output.tmp
-                ADJUSTED_SCALE=$(awk -v S="$ADJUSTED_SCALE" -v M="$MAG_FACTOR" \
+
+                # bxk4one fits a multiplier to the displacement actually seen in
+                # STAGE1.  Multiply the effective completed scales, not the
+                # larger scales originally requested from expfy.
+                ADJUSTED_SCALE=$(awk -v S="$STAGE1_TESTED_SCALE" -v M="$MAG_FACTOR" \
                     'BEGIN { print int(S * M) }')
-                ADJUSTED_SCALE2=$(awk -v S="$ADJUSTED_SCALE2" -v M="$MAG_FACTOR" \
+                ADJUSTED_SCALE2=$(awk -v S="$STAGE1_TESTED_SCALE2" -v M="$MAG_FACTOR" \
                     'BEGIN { print int(S * M) }')
 
                 apply_exp2 "$INPUT_ABS" "$ADJUSTED_SCALE" "$ADJUSTED_SCALE2" \
-                    "$sorted_VAL" "$sorted_VAL2" "$FINAL_CANDIDATE"
+                    "$sorted_VAL" "$sorted_VAL2" "$FINAL_CANDIDATE" \
+                    FINAL_TESTED_SCALE FINAL_TESTED_SCALE2
 
                 ./bnb 4 "$FINAL_CANDIDATE" > final.vec
                 displ "$VEC_INS" final.vec final.displ
                 GOT_RMSE=$(rmse final.displ "$INPL")
 
-                printf '%s|%s|%s|%s|%s|%s|%s\n' \
+                # Preserve the exact graph whose RMSE was measured.  expfy is
+                # randomized, so regenerating later would be slower and could
+                # produce a different graph from the candidate selected here.
+                local SAVED_CANDIDATE
+                SAVED_CANDIDATE="$TOP_DIR/candidate_$(printf '%02d' "$RANK").graph"
+                mv "$FINAL_CANDIDATE" "$SAVED_CANDIDATE"
+
+                # Store both the adjusted parameters and the saved graph path.
+                # The result file is published only after the graph is safely
+                # in TOP_DIR, so the parent never selects a missing candidate.
+                printf '%s|%s|%s|%s|%s|%s|%s|%s\n' \
                     "$GOT_RMSE" "$sorted_VAL" "$sorted_VAL2" \
-                    "$ADJUSTED_SCALE" "$ADJUSTED_SCALE2" "$sorted_rmse" "$RANK" \
+                    "$FINAL_TESTED_SCALE" "$FINAL_TESTED_SCALE2" "$sorted_rmse" "$RANK" \
+                    "$SAVED_CANDIDATE" \
                     > "$TOP_DIR/result_$(printf '%02d' "$RANK").tmp"
                 mv "$TOP_DIR/result_$(printf '%02d' "$RANK").tmp" \
                    "$TOP_DIR/result_$(printf '%02d' "$RANK").txt"
@@ -920,7 +1225,8 @@ run_round() {
         local BEST_MAG=""
         local BEST_MAG2=""
         local BEST_RMSE=""
-        local GOT_RMSE EXPECTED_RMSE RESULT_FILE
+        local BEST_GRAPH=""
+        local GOT_RMSE EXPECTED_RMSE RESULT_FILE CANDIDATE_GRAPH
 
         # Consume results by original rank, preserving the serial tie-breaking.
         for ((RANK=1; RANK<=${#TOP_LINES[@]}; RANK++)); do
@@ -930,7 +1236,12 @@ run_round() {
             fi
 
             IFS='|' read -r GOT_RMSE sorted_VAL sorted_VAL2 sorted_MAG sorted_MAG2 \
-                EXPECTED_RMSE _ < "$RESULT_FILE"
+                EXPECTED_RMSE _ CANDIDATE_GRAPH < "$RESULT_FILE"
+
+            if [ ! -s "$CANDIDATE_GRAPH" ]; then
+                echo "Saved graph for rank $RANK is missing or empty: $CANDIDATE_GRAPH" >&2
+                exit 1
+            fi
 
             echo "VAL=$sorted_VAL,$sorted_VAL2 MAG=$sorted_MAG,MAG2=$sorted_MAG2. expected RMSE=$EXPECTED_RMSE, got RMSE=$GOT_RMSE."
 
@@ -940,6 +1251,7 @@ run_round() {
                 BEST_VAL2="$sorted_VAL2"
                 BEST_MAG="$sorted_MAG"
                 BEST_MAG2="$sorted_MAG2"
+                BEST_GRAPH="$CANDIDATE_GRAPH"
             fi
         done
 
@@ -948,16 +1260,15 @@ run_round() {
             exit 1
         fi
 
-        SCALE=$(integer_part "$BEST_MAG")
-        SCALE2=$(integer_part "$BEST_MAG2")
-        if float_greater "$BEST_RMSE" "$had_rmse"; then
-            SCALE=0
-            SCALE2=0
-        fi
+        echo "Best pair was $BEST_VAL and $BEST_VAL2 with RMSE $BEST_RMSE and parameters $BEST_MAG,$BEST_MAG2"
 
-        echo "Best pair was $BEST_VAL and $BEST_VAL2 with rmse $BEST_RMSE"
-        apply_exp2 "$INPUT_ABS" "$SCALE" "$SCALE2" \
-            "$BEST_VAL" "$BEST_VAL2" "$OUTPUT_ABS"
+        if float_greater "$BEST_RMSE" "$had_rmse"; then
+            echo "The best evaluated pair was worse than the input (RMSE $had_rmse); keeping the input graph."
+            cp "$INPUT_ABS" "$OUTPUT_ABS"
+        else
+            echo "Using the saved best candidate directly; expfy will not be rerun."
+            cp "$BEST_GRAPH" "$OUTPUT_ABS"
+        fi
 
         echo "Achieved graphlet frequency:"
         "$BNB_ABS" 4 "$OUTPUT_ABS"
@@ -965,112 +1276,129 @@ run_round() {
 }
 
 generate_outinp() {
-	local InS="$1"
-	local ROOT_DIR
-	ROOT_DIR=$(pwd -P)
+        local InS="$1"
+        local ROOT_DIR
+        ROOT_DIR=$(pwd -P)
 
-	local INS_ABS TARGET_ABS VEC_INS_ABS EXPFY_ABS BNB_ABS
-	INS_ABS=$(realpath "$InS")
-	TARGET_ABS=$(realpath "$TARGET")
-	VEC_INS_ABS=$(realpath vecInS.txt)
-	EXPFY_ABS=$(realpath ./expfy)
-	BNB_ABS=$(realpath ./bnb)
+        local INS_ABS TARGET_ABS VEC_INS_ABS EXPFY_ABS BNB_ABS
+        INS_ABS=$(realpath "$InS")
+        TARGET_ABS=$(realpath "$TARGET")
+        VEC_INS_ABS=$(realpath vecInS.txt)
+        EXPFY_ABS=$(realpath ./expfy)
+        BNB_ABS=$(realpath ./bnb)
 
-	local MAX_JOBS="$PARALLEL_JOBS"
-	if ! [[ "$MAX_JOBS" =~ ^[1-9][0-9]*$ ]]; then
-		echo "PARALLEL_JOBS must be a positive integer, not '$MAX_JOBS'." >&2
-		return 1
-	fi
+        local MAX_JOBS="$PARALLEL_JOBS"
+        if ! [[ "$MAX_JOBS" =~ ^[1-9][0-9]*$ ]]; then
+                echo "PARALLEL_JOBS must be a positive integer, not '$MAX_JOBS'." >&2
+                return 1
+        fi
 
-	echo
-	echo "Re-getting transformation results with $MAX_JOBS parallel jobs"
-	echo
+        echo
+        echo "Re-getting transformation results with $MAX_JOBS parallel jobs"
+        echo
 
-	local -a PIDS=()
-	local FAILED=0
-	local VAL
+        local -a PIDS=()
+        local FAILED=0
+        local VAL
 
-	for VAL in "${ACTIVE_CANDS[@]}"; do
-		(
-			set -e
+        for VAL in "${ACTIVE_CANDS[@]}"; do
+                (
+                        set -e
 
-			local WORK_DIR
-			WORK_DIR=$(mktemp -d "$ROOT_DIR/.generate_outinp_${VAL}.XXXXXX")
-			trap 'rm -rf -- "$WORK_DIR"' EXIT
+                        local WORK_DIR
+                        WORK_DIR=$(mktemp -d "$ROOT_DIR/.generate_outinp_${VAL}.XXXXXX")
+                        trap 'rm -rf -- "$WORK_DIR"' EXIT
 
-			# expfy/bnb use files in the current directory.  Each candidate gets
-			# a private directory so their temporary files cannot overwrite one another.
-			for SHARED_FILE in data_middle.txt data_middle1.txt weights4.txt; do
-				if [ -f "$ROOT_DIR/$SHARED_FILE" ]; then
-					cp "$ROOT_DIR/$SHARED_FILE" "$WORK_DIR/$SHARED_FILE"
-				fi
-			done
+                        # expfy/bnb use files in the current directory.  Each candidate gets
+                        # a private directory so their temporary files cannot overwrite one another.
+                        for SHARED_FILE in data_middle.txt data_middle1.txt weights4.txt; do
+                                if [ -f "$ROOT_DIR/$SHARED_FILE" ]; then
+                                        cp "$ROOT_DIR/$SHARED_FILE" "$WORK_DIR/$SHARED_FILE"
+                                fi
+                        done
 
-			# Also expose every executable from the project directory.  This covers
-			# wrappers such as bnb that may launch another local executable (for
-			# example ./blant) while keeping their generated data files job-local.
-			for TOOL in "$ROOT_DIR"/*; do
-				if [ -f "$TOOL" ] && [ -x "$TOOL" ]; then
-					ln -s "$TOOL" "$WORK_DIR/${TOOL##*/}"
-				fi
-			done
+                        # Also expose every executable from the project directory.  This covers
+                        # wrappers such as bnb that may launch another local executable (for
+                        # example ./blant) while keeping their generated data files job-local.
+                        for TOOL in "$ROOT_DIR"/*; do
+                                if [ -f "$TOOL" ] && [ -x "$TOOL" ]; then
+                                        ln -s "$TOOL" "$WORK_DIR/${TOOL##*/}"
+                                fi
+                        done
 
-			# These two must exist even if their executable bits are unusual.
-			[ -e "$WORK_DIR/expfy" ] || ln -s "$EXPFY_ABS" "$WORK_DIR/expfy"
-			[ -e "$WORK_DIR/bnb" ] || ln -s "$BNB_ABS" "$WORK_DIR/bnb"
+                        # These two must exist even if their executable bits are unusual.
+                        [ -e "$WORK_DIR/expfy" ] || ln -s "$EXPFY_ABS" "$WORK_DIR/expfy"
+                        [ -e "$WORK_DIR/bnb" ] || ln -s "$BNB_ABS" "$WORK_DIR/bnb"
 
-			cd "$WORK_DIR"
+                        cd "$WORK_DIR"
 
-			# Bash uses dynamic scoping, so apply_exp sees this absolute TARGET.
-			local TARGET="$TARGET_ABS"
-			local BASE_SYNTH1="baseline1_val_${VAL}.txt"
-			local BASE_SYNTH2="baseline2_val_${VAL}.txt"
-			local OUT_INP="outinp_val_${VAL}.txt"
-			local SCALE
+                        # Bash uses dynamic scoping, so apply_exp sees this absolute TARGET.
+                        local TARGET="$TARGET_ABS"
+                        local BASE_SYNTH1="baseline1_val_${VAL}.txt"
+                        local BASE_SYNTH2="baseline2_val_${VAL}.txt"
+                        local OUT_INP="outinp_val_${VAL}.txt"
+                        local SCALE TESTED_SCALE1 TESTED_SCALE2
 
-			echo "Getting $VAL result"
-			: > "$OUT_INP"
+                        echo "Getting $VAL result"
 
-			SCALE=30000
-			apply_exp "$INS_ABS" "$SCALE" "$VAL" "$BASE_SYNTH1"
-			./bnb 4 "$BASE_SYNTH1" > "vecBS1_val_${VAL}.txt"
-			displ "$VEC_INS_ABS" "vecBS1_val_${VAL}.txt" "trfBS1_val_${VAL}.txt"
-			cat "trfBS1_val_${VAL}.txt" >> "$OUT_INP"
+                        SCALE=30000
+                        apply_exp "$INS_ABS" "$SCALE" "$VAL" "$BASE_SYNTH1" \
+                            TESTED_SCALE1
+                        ./bnb 4 "$BASE_SYNTH1" > "vecBS1_val_${VAL}.txt"
+                        displ "$VEC_INS_ABS" "vecBS1_val_${VAL}.txt" "trfBS1_val_${VAL}.txt"
 
-			SCALE=300000
-			apply_exp "$INS_ABS" "$SCALE" "$VAL" "$BASE_SYNTH2"
-			./bnb 4 "$BASE_SYNTH2" > "vecBS2_val_${VAL}.txt"
-			displ "$VEC_INS_ABS" "vecBS2_val_${VAL}.txt" "trfBS2_val_${VAL}.txt"
-			cat "trfBS2_val_${VAL}.txt" >> "$OUT_INP"
+                        SCALE=300000
+                        apply_exp "$INS_ABS" "$SCALE" "$VAL" "$BASE_SYNTH2" \
+                            TESTED_SCALE2
+                        ./bnb 4 "$BASE_SYNTH2" > "vecBS2_val_${VAL}.txt"
+                        displ "$VEC_INS_ABS" "vecBS2_val_${VAL}.txt" "trfBS2_val_${VAL}.txt"
 
-			# mv is atomic on the same filesystem, so run_round never sees a half-written file.
-			mv "$OUT_INP" "$ROOT_DIR/outinp_val_${VAL}.txt"
-			echo "Finished $VAL result"
-		) &
+                        # Each transformation file is self-contained:
+                        #   line 1: effective tested scales ka kb
+                        #   line 2: displacement measured at ka
+                        #   line 3: displacement measured at kb
+                        printf '%s %s\n' "$TESTED_SCALE1" "$TESTED_SCALE2" > "$OUT_INP"
+                        cat "trfBS1_val_${VAL}.txt" "trfBS2_val_${VAL}.txt" >> "$OUT_INP"
 
-		PIDS+=("$!")
+                        # bxk4f expects exactly 14 values per transformation:
+                        #   ka kb + six values at ka + six values at kb.
+                        # Catch malformed probe data here instead of letting bxk4f
+                        # fail later with only "incomplete input".
+                        local OUT_INP_WORDS
+                        OUT_INP_WORDS=$(wc -w < "$OUT_INP")
+                        if (( OUT_INP_WORDS != 14 )); then
+                                echo "Malformed $OUT_INP for transformation $VAL: expected 14 values (ka kb A[6] B[6]), got $OUT_INP_WORDS." >&2
+                                exit 1
+                        fi
 
-		# Keep at most MAX_JOBS candidates alive at once.
-		if (( ${#PIDS[@]} >= MAX_JOBS )); then
-			if ! wait "${PIDS[0]}"; then
-				FAILED=1
-			fi
-			PIDS=("${PIDS[@]:1}")
-		fi
-	done
+                        # mv is atomic on the same filesystem, so run_round never sees a half-written file.
+                        mv "$OUT_INP" "$ROOT_DIR/outinp_val_${VAL}.txt"
+                        echo "Finished $VAL result (tested scales: $TESTED_SCALE1, $TESTED_SCALE2)"
+                ) &
 
-	# Wait for the final partial batch.
-	local PID
-	for PID in "${PIDS[@]}"; do
-		if ! wait "$PID"; then
-			FAILED=1
-		fi
-	done
+                PIDS+=("$!")
 
-	if (( FAILED )); then
-		echo "At least one parallel generate_outinp job failed." >&2
-		return 1
-	fi
+                # Keep at most MAX_JOBS candidates alive at once.
+                if (( ${#PIDS[@]} >= MAX_JOBS )); then
+                        if ! wait "${PIDS[0]}"; then
+                                FAILED=1
+                        fi
+                        PIDS=("${PIDS[@]:1}")
+                fi
+        done
+
+        # Wait for the final partial batch.
+        local PID
+        for PID in "${PIDS[@]}"; do
+                if ! wait "$PID"; then
+                        FAILED=1
+                fi
+        done
+
+        if (( FAILED )); then
+                echo "At least one parallel generate_outinp job failed." >&2
+                return 1
+        fi
 }
 
 # Main loop
@@ -1078,43 +1406,19 @@ CURRENT="$INIT_SYNTH"
 ./bnb 4 "$TARGET" > vecTar.txt
 
 for ((i=1; i<=ROUNDS; i++)); do
-	if (( i == 5 )); then CMODE=1; fi
-	if (( i == 9 )); then CMODE=2; fi
-	if (( i == 13 )); then CMODE=3; fi
-	if (( i == 17 )); then CMODE=4; fi
-	if (( i == 21 )); then CMODE=5; fi
-	./bnb 4 "$CURRENT" > vecInS.txt
+        set_round_constraints "$i"
 
-    if (( i == 3 )); then
-        evb=0.6
-		degb=3
-		hdgb="$ROUND_HDGB_3"
-    fi
-    if (( i == 7 )); then
-        evb=1
-		degb=17
-		hdgb="$ROUND_HDGB_7"
-    fi
-    if (( i == 11 )); then
-        evb=0.9
-		degb=16
-		hdgb="$ROUND_HDGB_11"
-    fi
-    if (( i == 15 )); then
-        evb=0.7
-		degb=15
-		hdgb="$ROUND_HDGB_15"
-    fi
-    if (( i == 23 )); then
-        evb=0.5
-		degb=14
-		hdgb="$ROUND_HDGB_23"
-    fi
+        if (( i == 5 )); then CMODE=1; fi
+        if (( i == 9 )); then CMODE=2; fi
+        if (( i == 13 )); then CMODE=3; fi
+        if (( i == 17 )); then CMODE=4; fi
+        if (( i == 21 )); then CMODE=5; fi
+        ./bnb 4 "$CURRENT" > vecInS.txt
 
     if (( (i-1) % 4 == 0 )); then
-		./bnb 4 "$CURRENT" > bres.tmp
-		cat data_middle.txt > data_middle1.txt
-		refresh_rare_graphlets data_middle1.txt
+                ./bnb 4 "$CURRENT" > bres.tmp
+                cat data_middle.txt > data_middle1.txt
+                refresh_rare_graphlets data_middle1.txt
         generate_outinp "$CURRENT"
     fi
 
@@ -1128,7 +1432,8 @@ echo
 echo "Final output stored in $FINAL"
 rm -f baseline_val_*.txt outinp_val_*.txt synth1_*.txt \
       outinp_l_val_*.txt suminp_val_*.txt bext_val_*.txt \
-	  inp1l_*.txt synth_base_*.txt tmp_round*.txt PIS*.txt
+          inp1l_*.txt synth_base_*.txt tmp_round*.txt PIS*.txt
 rm -f round_results.tmp inp.txt inpl.txt vecBS*.txt vecOutty.txt trfBS.txt target_c.txt smth.txt bres.tmp \
-	  out_inplxzx.txt data1.txt data_middle.txt vecInS.txt vecTar.txt bextxzx.txt suminpxzx.txt data_middle1.txt idk.txt
+          out_inplxzx.txt data1.txt data_middle.txt vecInS.txt vecTar.txt bextxzx.txt suminpxzx.txt data_middle1.txt idk.txt \
+          expfy_samples_done.tmp .expfy_samples_*.tmp
 rm -rf baseline .generate_outinp_* .run_round.*
