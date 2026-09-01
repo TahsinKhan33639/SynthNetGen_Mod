@@ -105,7 +105,7 @@ int get_graph_id(const vector<vector<int>>& adj) {
 }
 
 SampleStats sample_edge_prob(vector<vector<int>>& adj, vector<vector<char>>& bvv, int num_samples, int num_samples2, int m1, int m2,
-					 vector<ld> x, ld evl, ld evbound, vector<int> degb, int degbound, vector<int> gdnd, int hdgbound) {
+					 vector<ld> x, ld evl, ld evbound, vector<int> degb, double degbound, vector<int> gdnd, int hdgbound) {
 	vector<double> cntr(6, 0);
     int n = adj.size();
 	vector<bool> gnif(n, false);
@@ -170,7 +170,8 @@ SampleStats sample_edge_prob(vector<vector<int>>& adj, vector<vector<char>>& bvv
 	int lklk1=0, lklk2=0, lklk3=0, lklk4=0;
 
     auto op = [&](const vector<tuple<int,int,int>>& ops) {
-        bool open = true;
+        if (ops.empty()) return;
+
         auto valid = [&](int node, ld new_val) {
             ld old_val = y[node];
             if (new_val <= 0 || old_val <= 0 || x[node] <= 0)
@@ -185,7 +186,7 @@ SampleStats sample_edge_prob(vector<vector<int>>& adj, vector<vector<char>>& bvv
             ld old_dist = abs(log(old_val) - target);
             if (new_dist < old_dist)
                 return true;
-			lklk1++;
+            lklk1++;
             return false;
         };
 
@@ -197,19 +198,27 @@ SampleStats sample_edge_prob(vector<vector<int>>& adj, vector<vector<char>>& bvv
             int target = degb[node];
 
             int new_dist = abs(new_val - target);
-            if (new_dist <= degbound)
+            double new_distl = abs(log(new_val) - log(target));
+            if (new_distl <= degbound)
                 return true;
+
+			if (new_dist <= max(degbound*n*3/100, (double)5))
+				return true;
 
             int old_dist = abs(old_val - target);
             if (new_dist < old_dist)
                 return true;
-			lklk2++;
+            lklk2++;
             return false;
         };
 
         auto validhdg = [&](int dgX, int new_val) {
+            if (dgX < 0 || dgX >= n)
+                return false;
+
             int old_val = hdg[dgX];
-            if (new_val <= 0 || old_val <= 0)
+            // Zero nodes in a degree bin is valid. Only negative counts are invalid.
+            if (new_val < 0 || old_val < 0)
                 return false;
 
             int target = hdgb[dgX];
@@ -222,58 +231,89 @@ SampleStats sample_edge_prob(vector<vector<int>>& adj, vector<vector<char>>& bvv
             if (new_dist < old_dist)
                 return true;
 
-			lklk3++;
-            return true;
+            lklk3++;
+            return false;
         };
 
         set<int> nodesinop;
+        set<pair<int,int>> touched_edges;
+
+        // Validate the complete operation list against the current simple graph
+        // before changing temporary degrees or indexing histogram arrays.
         for (auto [type, n1, n2] : ops) {
+            if (type != 1 && type != 2)
+                return;
+            if (n1 < 0 || n1 >= n || n2 < 0 || n2 >= n || n1 == n2)
+                return;
+
+            int a = min(n1, n2);
+            int b = max(n1, n2);
+            if (!touched_edges.insert({a, b}).second)
+                return;
+
+            bool edge_exists = bvv[n1][n2] != 0;
+            if ((type == 1 && edge_exists) ||
+                (type == 2 && !edge_exists)) {
+                return;
+            }
+
             nodesinop.insert(n1);
             nodesinop.insert(n2);
         }
 
-        for (auto ndX : nodesinop){
-            z[ndX] = y[ndX];
-            degz[ndX] = deg[ndX];
+        for (int node : nodesinop) {
+            z[node] = y[node];
+            degz[node] = deg[node];
         }
 
         for (auto [type, n1, n2] : ops) {
-            if (type == 1){
-                z[n1] += 1/evl*x[n2];
-                z[n2] += 1/evl*x[n1];
-                degz[n1]++; degz[n2]++;
-				if (bvv[n1][n2] == 1) open = false;
-            }
-            if (type == 2){
-                z[n1] -= 1/evl*x[n2];
-                z[n2] -= 1/evl*x[n1];
-                degz[n1]--; degz[n2]--;
-				if (bvv[n1][n2] == 0) open = false;
+            if (type == 1) {
+                z[n1] += 1 / evl * x[n2];
+                z[n2] += 1 / evl * x[n1];
+                degz[n1]++;
+                degz[n2]++;
+            } else {
+                z[n1] -= 1 / evl * x[n2];
+                z[n2] -= 1 / evl * x[n1];
+                degz[n1]--;
+                degz[n2]--;
             }
         }
 
-        for (auto ndX : nodesinop){
-            open &= valid(ndX, z[ndX]);
-            open &= valideg(ndX, degz[ndX]);
+        // A simple n-node graph has degrees in [0, n-1]. Reject an operation
+        // before any degree is used as a histogram index if it violates that.
+        for (int node : nodesinop) {
+            if (deg[node] < 0 || deg[node] >= n ||
+                degz[node] < 0 || degz[node] >= n) {
+                return;
+            }
         }
 
-		set<int> related_deg;
-        for(auto ndX : nodesinop){
-            related_deg.insert(deg[ndX]);
-            related_deg.insert(degz[ndX]);
+        bool open = true;
+        for (int node : nodesinop) {
+            open &= valid(node, z[node]);
+            open &= valideg(node, degz[node]);
         }
-		for (auto rdeg : related_deg) {
-			hdgz[rdeg] = hdg[rdeg];
-		}
-        for(auto ndX : nodesinop){
-            hdgz[deg[ndX]]--; hdgz[degz[ndX]]++;
-		}
-		for (auto rdeg : related_deg) {
-            open &= validhdg(rdeg, hdgz[rdeg]);
-		}
+
+        set<int> related_deg;
+        for (int node : nodesinop) {
+            related_deg.insert(deg[node]);
+            related_deg.insert(degz[node]);
+        }
+
+        for (int degree : related_deg) {
+            hdgz[degree] = hdg[degree];
+        }
+        for (int node : nodesinop) {
+            hdgz[deg[node]]--;
+            hdgz[degz[node]]++;
+        }
+        for (int degree : related_deg) {
+            open &= validhdg(degree, hdgz[degree]);
+        }
 
         if (!open) return;
-		lklk4++;
+        lklk4++;
         if (active_slot == 1 && donereps < num_samples) donereps++;
         if (active_slot == 2 && donereps2 < num_samples2) donereps2++;
         for (auto [type, n1, n2] : ops) {
@@ -281,7 +321,6 @@ SampleStats sample_edge_prob(vector<vector<int>>& adj, vector<vector<char>>& bvv
             if (type == 2) d(n1, n2);
         }
     };
-
 
 	num_samples = max(0, num_samples);
 	num_samples2 = max(0, num_samples2);
@@ -606,6 +645,99 @@ void readGraph(const string& filename,
         adjMat[u][v] = adjMat[v][u] = 1;
     }
 }
+// Return every connected component as a list of node IDs.
+vector<vector<int>> get_connected_components(
+    const vector<vector<int>>& adj) {
+    const int n = static_cast<int>(adj.size());
+    vector<char> visited(n, 0);
+    vector<vector<int>> components;
+
+    for (int start = 0; start < n; ++start) {
+        if (visited[start]) continue;
+
+        vector<int> component;
+        queue<int> q;
+        q.push(start);
+        visited[start] = 1;
+
+        while (!q.empty()) {
+            const int u = q.front();
+            q.pop();
+            component.push_back(u);
+
+            for (int v : adj[u]) {
+                if (!visited[v]) {
+                    visited[v] = 1;
+                    q.push(v);
+                }
+            }
+        }
+
+        components.push_back(move(component));
+    }
+
+    return components;
+}
+
+// This runs only after all requested transformations are finished. If the
+// graph has k components, it adds exactly k-1 bridge edges. On each step it
+// chooses a random node X in the current largest component and connects X to a
+// random node in one randomly chosen remaining component.
+void reconnect_graph(vector<vector<int>>& adj,
+                     vector<vector<char>>& bvv) {
+    vector<vector<int>> components = get_connected_components(adj);
+    if (components.size() <= 1) return;
+
+    const size_t initial_component_count = components.size();
+    cerr << "Graph is disconnected: " << initial_component_count
+         << " connected components.\n";
+
+    random_device rd;
+    mt19937 rng(rd());
+
+    while (components.size() > 1) {
+        // Put the current largest component at index 0.
+        const auto largest_it = max_element(
+            components.begin(), components.end(),
+            [](const vector<int>& a, const vector<int>& b) {
+                return a.size() < b.size();
+            });
+        iter_swap(components.begin(), largest_it);
+
+        uniform_int_distribution<size_t> other_component_dist(
+            1, components.size() - 1);
+        const size_t other_index = other_component_dist(rng);
+
+        uniform_int_distribution<size_t> x_dist(
+            0, components[0].size() - 1);
+        uniform_int_distribution<size_t> y_dist(
+            0, components[other_index].size() - 1);
+
+        const int x = components[0][x_dist(rng)];
+        const int y = components[other_index][y_dist(rng)];
+
+        // Nodes in different components cannot already share an edge.
+        adj[x].push_back(y);
+        adj[y].push_back(x);
+        bvv[x][y] = bvv[y][x] = 1;
+
+        // The bridge merges these two components. The merged component remains
+        // at index 0 and is reconsidered as the largest on the next iteration.
+        components[0].insert(
+            components[0].end(),
+            components[other_index].begin(),
+            components[other_index].end());
+
+        if (other_index + 1 != components.size()) {
+            swap(components[other_index], components.back());
+        }
+        components.pop_back();
+    }
+
+    cerr << "Added " << (initial_component_count - 1)
+         << " bridge edges to reconnect the graph.\n";
+}
+
 ld rmsewc(vector<vector<int>> adj, vector<ld> x, ld evl) {
 	int n = adj.size();
 	vector<ld> y(n);
@@ -779,6 +911,7 @@ int main(int argc, char* argv[]) {
 	int m2 = stoi(argv[6]);
 	ld evbound = stod(argv[7]);
 	int degbound = stoi(argv[8]);
+	double degboundf = (double)degbound/140;
 	int hdgbound = stoi(argv[9]);
 	const string completed_samples_file =
 	    argc >= 11 ? argv[10] : "expfy_samples_done.tmp";
@@ -800,7 +933,7 @@ int main(int argc, char* argv[]) {
 
     const SampleStats stats = sample_edge_prob(
         adj, bvv, num_samples, num_samples2, m, m2, evcb, evlt,
-        evbound, degb, degbound, gdnd, hdgbound);
+        evbound, degb, degboundf, gdnd, hdgbound);
 
     ofstream completed_out(completed_samples_file);
     if (!completed_out) {
@@ -810,6 +943,10 @@ int main(int argc, char* argv[]) {
     }
     completed_out << stats.done1 << " " << stats.done2 << "\n";
     completed_out.close();
+
+    // Connectivity repair is deliberately done after transformation sampling,
+    // so these bridge edges do not count as completed graphlet transformations.
+    reconnect_graph(adj, bvv);
 
     for (size_t u = 0; u < adj.size(); u++) {
         for (int v : adj[u]) {

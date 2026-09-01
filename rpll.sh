@@ -18,13 +18,19 @@ MIN_EFFECTIVE_N=500
 MAX_EFFECTIVE_N=5000
 MAX_APPLY_SAMPLES=100000
 
-# The final optimization round always uses these tightest constraints.  hdgb
+# The final optimization round always uses these tightest constraints. hdgb
 # is expressed at the 1,000-node reference size and is scaled after the target
-# graph has been cleaned and EFFECTIVE_N is known.
+# graph has been cleaned and EFFECTIVE_N is known. TIGHTEST_DEGB is the integer
+# code passed to expfy; expfy divides it by 140, so 14 means a log-degree
+# tolerance of 0.1.
 TIGHTEST_EVB=0.5
 TIGHTEST_DEGB=14
 TIGHTEST_HDGB_REFERENCE=40
 ROUND_BACKWARD_FACTOR=1.25
+
+# After the requested RSEAS rounds, run one four-round equal-weight RMSE
+# polishing block.  The command-line round count still means RSEAS rounds.
+EXTRA_RMSE_ROUNDS=4
 
 clamp_int() {
     local VALUE="$1"
@@ -69,6 +75,205 @@ float_above_by() {
     awk -v A="$1" -v B="$2" -v D="$3" 'BEGIN { exit !(A > B + D) }'
 }
 
+
+# Graphlet-frequency logarithms use the same floor in Bash/Python and in the
+# four phase-specific C++ optimizers.
+LOG_FLOOR=-15.0
+
+# Round-level RSEAS state.  The six positions correspond to graphlets
+# 5, 6, 7, 8, 9, and 10, in the order emitted by bnb 4.
+RSEAS_E=0.0
+RSEAS_E_INITIALIZED=0
+RSEAS_WEIGHTS=(1 1 4 30 1 2)
+PREVIOUS_WORST_GRAPHLET=""
+
+# Log displacement: log(A)-log(B), using LOG_FLOOR for a zero frequency.
+displ() {
+    python3 - "$1" "$2" "$3" "$LOG_FLOOR" << 'EOF_PY'
+import math
+import sys
+
+path_a, path_b, output_path, log_floor_text = sys.argv[1:5]
+log_floor = float(log_floor_text)
+
+A = [float(x) for x in open(path_a, encoding="utf-8").read().split()]
+B = [float(x) for x in open(path_b, encoding="utf-8").read().split()]
+if len(A) < 6 or len(B) < 6:
+    raise SystemExit("Expected at least six graphlet-frequency values")
+
+def safe_log(value):
+    return math.log(value) if value > 0.0 else log_floor
+
+diff = [safe_log(A[i]) - safe_log(B[i]) for i in range(6)]
+open(output_path, "w", encoding="utf-8").write(
+    " ".join(format(value, ".17g") for value in diff) + "\n"
+)
+EOF_PY
+}
+
+# Score two six-coordinate displacement vectors with one fixed RSEAS state.
+# The caller supplies e followed by six positive weights.
+rseas_with_config() {
+    local FILE_A="$1"
+    local FILE_B="$2"
+    local ERROR_RANGE="$3"
+    shift 3
+
+    if (( $# != 6 )); then
+        echo "rseas_with_config requires exactly six weights." >&2
+        return 1
+    fi
+
+    python3 - "$FILE_A" "$FILE_B" "$ERROR_RANGE" "$@" << 'EOF_PY'
+import math
+import sys
+
+path_a, path_b = sys.argv[1:3]
+error_range = float(sys.argv[3])
+weights = [float(x) for x in sys.argv[4:10]]
+
+A = [float(x) for x in open(path_a, encoding="utf-8").read().split()]
+B = [float(x) for x in open(path_b, encoding="utf-8").read().split()]
+if len(A) < 6 or len(B) < 6:
+    raise SystemExit("Expected at least six values in each RSEAS vector")
+if not math.isfinite(error_range) or error_range < 0.0:
+    raise SystemExit("RSEAS error range must be a finite nonnegative number")
+if len(weights) != 6 or any((not math.isfinite(w) or w <= 0.0) for w in weights):
+    raise SystemExit("RSEAS requires six positive finite weights")
+
+distances = [abs(A[i] - B[i]) for i in range(6)]
+maximum_distance = max(distances)
+
+if any(distance > error_range for distance in distances):
+    result = sum(
+        weights[i] * max(0.0, distances[i] - error_range) ** 2
+        for i in range(6)
+    )
+else:
+    result = maximum_distance - error_range
+
+print(format(result, ".17g"))
+EOF_PY
+}
+
+rseas() {
+    rseas_with_config "$1" "$2" "$RSEAS_E" "${RSEAS_WEIGHTS[@]}"
+}
+
+# Equal-weight RMSE used in the old pipeline.  With six unit weights this is
+# sqrt(sum_i (A_i-B_i)^2).  The missing division by six is retained deliberately
+# so reported values remain comparable with earlier runs; it does not affect
+# candidate ordering or the optimizer's chosen scales.
+unit_rmse() {
+    python3 - "$1" "$2" << 'EOF_PY'
+import math
+import sys
+
+path_a, path_b = sys.argv[1:3]
+A = [float(x) for x in open(path_a, encoding="utf-8").read().split()]
+B = [float(x) for x in open(path_b, encoding="utf-8").read().split()]
+if len(A) < 6 or len(B) < 6:
+    raise SystemExit("Expected at least six values in each RMSE vector")
+
+value = sum((A[i] - B[i]) ** 2 for i in range(6))
+print(format(math.sqrt(value), ".17g"))
+EOF_PY
+}
+
+# run_round sets ROUND_OBJECTIVE to RSEAS or RMSE.  Bash's dynamic scoping and
+# process inheritance make that fixed phase choice visible inside its workers.
+objective_score() {
+    case "$ROUND_OBJECTIVE" in
+        RSEAS) rseas "$1" "$2" ;;
+        RMSE)  unit_rmse "$1" "$2" ;;
+        *)
+            echo "Unknown round objective '$ROUND_OBJECTIVE'." >&2
+            return 1
+            ;;
+    esac
+}
+
+# Print: worst_graphlet max_log_error candidate_error_range. The candidate
+# range is 0.75*max_log_error; set_round_rseas_state then caps it at the
+# preceding round's e. Ties are broken by taking the first coordinate, so
+# graphlet 5 wins a complete tie, then 6, and so on.
+log_error_summary() {
+    python3 - "$1" "$2" "$LOG_FLOOR" << 'EOF_PY'
+import math
+import sys
+
+current_path, target_path, log_floor_text = sys.argv[1:4]
+log_floor = float(log_floor_text)
+
+current = [float(x) for x in open(current_path, encoding="utf-8").read().split()]
+target = [float(x) for x in open(target_path, encoding="utf-8").read().split()]
+if len(current) < 6 or len(target) < 6:
+    raise SystemExit("Expected six graphlet frequencies when deriving RSEAS state")
+
+def safe_log(value):
+    return math.log(value) if value > 0.0 else log_floor
+
+distances = [
+    abs(safe_log(current[i]) - safe_log(target[i]))
+    for i in range(6)
+]
+worst_index = max(range(6), key=lambda index: distances[index])
+maximum_distance = distances[worst_index]
+error_range = 0.75 * maximum_distance
+
+print(
+    worst_index + 5,
+    format(maximum_distance, ".17g"),
+    format(error_range, ".17g"),
+)
+EOF_PY
+}
+
+set_round_rseas_state() {
+    local ROUND_INDEX="$1"
+    local CURRENT_VEC="$2"
+    local TARGET_VEC="$3"
+    local WORST_GRAPHLET MAX_ERROR NEW_ERROR_RANGE WEIGHT_INDEX
+    local PREVIOUS_ERROR_RANGE=""
+    local REPEATED_TEXT=""
+    local ERROR_RANGE_TEXT=""
+
+    read -r WORST_GRAPHLET MAX_ERROR NEW_ERROR_RANGE \
+        < <(log_error_summary "$CURRENT_VEC" "$TARGET_VEC")
+
+    WEIGHT_INDEX=$((WORST_GRAPHLET - 5))
+    if [[ -n "$PREVIOUS_WORST_GRAPHLET" && \
+          "$WORST_GRAPHLET" == "$PREVIOUS_WORST_GRAPHLET" ]]; then
+        RSEAS_WEIGHTS[$WEIGHT_INDEX]=$((RSEAS_WEIGHTS[$WEIGHT_INDEX] + 1))
+        REPEATED_TEXT="; repeated worst graphlet, increased its weight"
+    fi
+
+    PREVIOUS_WORST_GRAPHLET="$WORST_GRAPHLET"
+
+    # The first RSEAS round has no preceding e. After that, e is monotone
+    # nonincreasing:
+    #     e = min(0.75 * maxLogDist, previous_e).
+    if (( RSEAS_E_INITIALIZED == 0 )); then
+        RSEAS_E="$NEW_ERROR_RANGE"
+        RSEAS_E_INITIALIZED=1
+    else
+        PREVIOUS_ERROR_RANGE="$RSEAS_E"
+        RSEAS_E=$(awk \
+            -v CANDIDATE="$NEW_ERROR_RANGE" \
+            -v PREVIOUS="$PREVIOUS_ERROR_RANGE" \
+            'BEGIN {
+                printf "%.17g\n", (CANDIDATE < PREVIOUS ? CANDIDATE : PREVIOUS)
+            }')
+
+        if awk -v CANDIDATE="$NEW_ERROR_RANGE" -v PREVIOUS="$PREVIOUS_ERROR_RANGE" \
+            'BEGIN { exit !(CANDIDATE > PREVIOUS) }'; then
+            ERROR_RANGE_TEXT="; candidate e=$NEW_ERROR_RANGE capped at previous e=$PREVIOUS_ERROR_RANGE"
+        fi
+    fi
+
+    echo "Round $ROUND_INDEX/$ROUNDS RSEAS state: worst graphlet=$WORST_GRAPHLET, max log error=$MAX_ERROR, e=$RSEAS_E, weights=${RSEAS_WEIGHTS[*]}$REPEATED_TEXT$ERROR_RANGE_TEXT"
+}
+
 configure_node_scaled_parameters() {
     if ! NODE_COUNT=$(graph_node_count "$TARGET"); then
         echo "Could not determine the node count from $TARGET." >&2
@@ -95,8 +300,9 @@ configure_node_scaled_parameters() {
     OUTPEV_LARGE_SAMPLES=$(scale_from_reference 200)
 
     # hdgb is an absolute count tolerance in a degree-histogram bin, so it
-    # should scale with node count.  evb is dimensionless and degb is a
-    # per-node degree difference, so neither is scaled merely because n grows.
+    # should scale with node count. evb is dimensionless. degb is an encoded
+    # log-degree tolerance; expfy divides it by 140 and computes its separate
+    # n-dependent absolute fallback internally, so rpll does not rescale it.
     INIT_HDGB_1=$(scale_from_reference 50)
     INIT_HDGB_2=$(scale_from_reference 40)
     INIT_HDGB_3=$(scale_from_reference 30)
@@ -112,10 +318,11 @@ configure_node_scaled_parameters() {
     echo "PIS samples: $PIS1_SAMPLES, $PIS2_SAMPLES, $PIS3_SAMPLES; outpev samples: $OUTPEV_SMALL_SAMPLES, $OUTPEV_LARGE_SAMPLES."
 }
 
-# Build the constraint schedule backward from the final round.  For evb the
-# previous value is exactly 1.25 times the next value.  degb and hdgb are
-# positive integers, so each backward multiplication is rounded to the nearest
-# integer.  Consequently, ROUNDS=1 uses the tightest values immediately, while
+# Build the constraint schedule backward from the final round. For evb the
+# previous value is exactly 1.25 times the next value. The encoded degb value
+# and hdgb are positive integers, so each backward multiplication is rounded
+# to the nearest integer. Consequently, ROUNDS=1 uses the tightest values
+# immediately, while
 # every larger run reaches those same values on its final iteration.
 declare -a ROUND_EVB_SCHEDULE
 declare -a ROUND_DEGB_SCHEDULE
@@ -165,7 +372,19 @@ set_round_constraints() {
     degb="${ROUND_DEGB_SCHEDULE[$ROUND_INDEX]}"
     hdgb="${ROUND_HDGB_SCHEDULE[$ROUND_INDEX]}"
 
-    echo "Round $ROUND_INDEX/$ROUNDS constraints: evb=$evb, degb=$degb, hdgb=$hdgb"
+    echo "RSEAS round $ROUND_INDEX/$ROUNDS constraints: evb=$evb, degb=$degb, hdgb=$hdgb"
+}
+
+set_rmse_round_constraints() {
+    local ROUND_INDEX="$1"
+
+    # The RSEAS schedule already reaches these tightest values on its last
+    # round.  Keep them fixed during all four appended polishing rounds.
+    evb="$TIGHTEST_EVB"
+    degb="$TIGHTEST_DEGB"
+    hdgb="$TIGHTEST_HDGB"
+
+    echo "RMSE polishing round $ROUND_INDEX/$EXTRA_RMSE_ROUNDS constraints: evb=$evb, degb=$degb, hdgb=$hdgb"
 }
 
 INITIAL_GRAPH_GIVEN=0
@@ -234,63 +453,34 @@ else
 fi
 
 # When a base synth was supplied by the user, each complete PIS candidate is
-# accepted only when its weighted RMSE is no greater than that of the last
-# accepted graph. PIS occurs before the optimization rounds, so it uses row 0
-# of weights4.txt, matching CMODE=0.
+# accepted only when its RSEAS is no greater than that of the last accepted
+# graph. PIS is outside the optimization rounds, so it uses six unit weights
+# and one error range fixed from the graph entering PIS.
 PIS_TARGET_VEC="pis_target_vec.tmp"
-PIS_CURRENT_RMSE=""
+PIS_CURRENT_RSEAS=""
+PIS_RSEAS_E=0.0
+PIS_RSEAS_WEIGHTS=(1 1 1 1 1 1)
 
-pis_graph_rmse() {
+pis_graph_rseas() {
     local GRAPH="$1"
-    local VEC_FILE SCORE STATUS
+    local VEC_FILE DISPL_FILE SCORE STATUS
 
     VEC_FILE=$(mktemp ".pis_vec.XXXXXX")
+    DISPL_FILE=$(mktemp ".pis_displ.XXXXXX")
     if ! ./bnb 4 "$GRAPH" > "$VEC_FILE"; then
-        rm -f "$VEC_FILE"
+        rm -f "$VEC_FILE" "$DISPL_FILE"
         return 1
     fi
 
-    SCORE=$(python3 - "$VEC_FILE" "$PIS_TARGET_VEC" f0.txt weights4.txt << 'PYEOF'
-import math
-import sys
-
-vec_path, target_path, zero_path, weights_path = sys.argv[1:5]
-
-def read_numbers(path):
-    with open(path, "r", encoding="utf-8") as f:
-        return [float(x) for x in f.read().split()]
-
-A = read_numbers(vec_path)
-B = read_numbers(target_path)
-F0 = read_numbers(zero_path)
-
-with open(weights_path, "r", encoding="utf-8") as f:
-    first_line = f.readline()
-weights = [float(x) for x in first_line.split()]
-if not weights:
-    raise SystemExit(f"No CMODE=0 weights found in {weights_path}")
-
-displacement = []
-for a, b in zip(A, B):
-    if a <= 0 or b <= 0:
-        displacement.append(0.0)
-    else:
-        displacement.append(math.log(a) - math.log(b))
-
-n = min(len(F0), len(displacement), len(weights), 6)
-if n == 0:
-    raise SystemExit("Cannot compute weighted RMSE from empty vectors")
-
-value = sum(weights[i] * (F0[i] - displacement[i]) ** 2 for i in range(n))
-print(math.sqrt(value))
-PYEOF
-    ) || {
+    displ "$VEC_FILE" "$PIS_TARGET_VEC" "$DISPL_FILE"
+    SCORE=$(rseas_with_config f0.txt "$DISPL_FILE" "$PIS_RSEAS_E" \
+        "${PIS_RSEAS_WEIGHTS[@]}") || {
         STATUS=$?
-        rm -f "$VEC_FILE"
+        rm -f "$VEC_FILE" "$DISPL_FILE"
         return "$STATUS"
     }
 
-    rm -f "$VEC_FILE"
+    rm -f "$VEC_FILE" "$DISPL_FILE"
     printf '%s\n' "$SCORE"
 }
 
@@ -309,19 +499,19 @@ accept_pis_candidate() {
     # re-sample the same graph and accidentally change the remembered score.
     if cmp -s "$BEFORE" "$CANDIDATE"; then
         mv "$CANDIDATE" "$OUTPUT"
-        echo "$LABEL made no change; weighted RMSE remains $PIS_CURRENT_RMSE."
+        echo "$LABEL made no change; RSEAS remains $PIS_CURRENT_RSEAS."
         return
     fi
 
-    local CANDIDATE_RMSE
-    CANDIDATE_RMSE=$(pis_graph_rmse "$CANDIDATE")
+    local CANDIDATE_RSEAS
+    CANDIDATE_RSEAS=$(pis_graph_rseas "$CANDIDATE")
 
-    echo "$LABEL weighted RMSE: before=$PIS_CURRENT_RMSE, candidate=$CANDIDATE_RMSE"
+    echo "$LABEL RSEAS: before=$PIS_CURRENT_RSEAS, candidate=$CANDIDATE_RSEAS"
 
-    if awk -v NEW="$CANDIDATE_RMSE" -v OLD="$PIS_CURRENT_RMSE" \
+    if awk -v NEW="$CANDIDATE_RSEAS" -v OLD="$PIS_CURRENT_RSEAS" \
         'BEGIN { exit !(NEW <= OLD) }'; then
         mv "$CANDIDATE" "$OUTPUT"
-        PIS_CURRENT_RMSE="$CANDIDATE_RMSE"
+        PIS_CURRENT_RSEAS="$CANDIDATE_RSEAS"
         echo "$LABEL accepted."
     else
         cp "$BEFORE" "$OUTPUT"
@@ -331,9 +521,23 @@ accept_pis_candidate() {
 }
 
 if (( INITIAL_GRAPH_GIVEN )); then
+    local_pis_initial_vec=$(mktemp ".pis_initial_vec.XXXXXX")
+    local_pis_initial_displ=$(mktemp ".pis_initial_displ.XXXXXX")
+
     ./bnb 4 "$TARGET" > "$PIS_TARGET_VEC"
-    PIS_CURRENT_RMSE=$(pis_graph_rmse "$PRE_INIT_SYNTH")
-    echo "Initial graph weighted RMSE before PIS: $PIS_CURRENT_RMSE"
+    ./bnb 4 "$PRE_INIT_SYNTH" > "$local_pis_initial_vec"
+
+    read -r PIS_WORST_GRAPHLET PIS_MAX_ERROR PIS_RSEAS_E \
+        < <(log_error_summary "$local_pis_initial_vec" "$PIS_TARGET_VEC")
+
+    displ "$local_pis_initial_vec" "$PIS_TARGET_VEC" "$local_pis_initial_displ"
+    PIS_CURRENT_RSEAS=$(rseas_with_config f0.txt "$local_pis_initial_displ" \
+        "$PIS_RSEAS_E" "${PIS_RSEAS_WEIGHTS[@]}")
+
+    rm -f "$local_pis_initial_vec" "$local_pis_initial_displ"
+
+    echo "PIS RSEAS state: worst graphlet=$PIS_WORST_GRAPHLET, max log error=$PIS_MAX_ERROR, e=$PIS_RSEAS_E, weights=${PIS_RSEAS_WEIGHTS[*]}"
+    echo "Initial graph RSEAS before PIS: $PIS_CURRENT_RSEAS"
 fi
 
 PIS1_CANDIDATE="PIS1_candidate.txt"
@@ -460,69 +664,6 @@ ec[60]=+1;
 BASELINE_DIR="baseline"
 mkdir -p "$BASELINE_DIR"
 
-# Log displacement
-displ() {
-    python3 - "$1" "$2" "$3" << 'EOF_PY'
-import sys, math
-
-A = list(map(float, open(sys.argv[1]).read().split()))
-B = list(map(float, open(sys.argv[2]).read().split()))
-
-diff = []
-for a, b in zip(A, B):
-    if a <= 0 or b <= 0:
-        diff.append(0.0)
-    else:
-        diff.append(math.log(a) - math.log(b))
-open(sys.argv[3], "w").write(" ".join(map(str, diff)) + "\n")
-EOF_PY
-}
-
-# Linear displacement
-disp() {
-    python3 - "$1" "$2" "$3" << 'EOF_PY'
-import sys, math
-
-A = list(map(float, open(sys.argv[1]).read().split()))
-B = list(map(float, open(sys.argv[2]).read().split()))
-
-diff = []
-for a, b in zip(A, B):
-    if a <= 0 or b <= 0:
-        diff.append(0.0)
-    else:
-        diff.append(a - b)
-open(sys.argv[3], "w").write(" ".join(map(str, diff)) + "\n")
-EOF_PY
-}
-
-
-CMODE=0
-
-mapfile -t weights_table < weights4.txt
-
-# RMSE
-rmse() {
-    read -a W <<< "${weights_table[$CMODE]}"
-
-    python3 - "$1" "$2" "${W[@]}" << 'EOF_PY'
-import sys, math
-
-fileA, fileB, cmode = sys.argv[1], sys.argv[2], int(sys.argv[3])
-
-A = list(map(float, open(fileA).read().split()))
-B = list(map(float, open(fileB).read().split()))
-
-w = list(map(float, sys.argv[3:]))
-
-n = min(len(A), len(B), 6)
-
-num = sum(w[i] * (A[i]-B[i])**2 for i in range(n))
-rmse = math.sqrt(num)
-print(rmse)
-EOF_PY
-}
-
 # Create an isolated current directory for a parallel worker.  Several of the
 # project executables create fixed-name scratch files such as data_middle.txt,
 # so merely changing the shell output filename is not enough to prevent races.
@@ -533,7 +674,7 @@ prepare_parallel_worker() {
 
     mkdir -p "$WORK_DIR"
 
-    for SHARED_FILE in data_middle.txt data_middle1.txt weights4.txt f0.txt; do
+    for SHARED_FILE in data_middle.txt data_middle1.txt f0.txt; do
         if [ -f "$ROOT_DIR/$SHARED_FILE" ]; then
             cp "$ROOT_DIR/$SHARED_FILE" "$WORK_DIR/$SHARED_FILE"
         fi
@@ -872,6 +1013,15 @@ run_round() {
 
         local INPUT_SYNTH="$1"
         local OUTPUT_SYNTH="$2"
+        local ROUND_OBJECTIVE="$3"
+
+        case "$ROUND_OBJECTIVE" in
+            RSEAS|RMSE) ;;
+            *)
+                echo "run_round objective must be RSEAS or RMSE, not '$ROUND_OBJECTIVE'." >&2
+                exit 1
+                ;;
+        esac
         local ROOT_DIR
         ROOT_DIR=$(pwd -P)
 
@@ -889,8 +1039,13 @@ run_round() {
         VEC_TAR_ABS=$(realpath vecTar.txt)
         F0_ABS=$(realpath f0.txt)
         BNB_ABS=$(realpath ./bnb)
-        BXK4F_ABS=$(realpath ./bxk4f)
-        BXK4ONE_ABS=$(realpath ./bxk4one)
+        if [ "$ROUND_OBJECTIVE" = "RSEAS" ]; then
+            BXK4F_ABS=$(realpath ./bxk4f_rseas)
+            BXK4ONE_ABS=$(realpath ./bxk4one_rseas)
+        else
+            BXK4F_ABS=$(realpath ./bxk4f_rmse)
+            BXK4ONE_ABS=$(realpath ./bxk4one_rmse)
+        fi
 
         local ROUND_DIR
         ROUND_DIR=$(mktemp -d "$ROOT_DIR/.run_round.XXXXXX")
@@ -906,10 +1061,10 @@ run_round() {
         displ "$VEC_INS" "$VEC_TAR_ABS" "$INPL"
         cat "$VEC_INS" "$VEC_TAR_ABS" > "$INP"
 
-        local had_rmse
-        had_rmse=$(rmse "$F0_ABS" "$INPL")
+        local had_score
+        had_score=$(objective_score "$F0_ABS" "$INPL")
 
-        echo "New round with input $INPUT_SYNTH"
+        echo "New $ROUND_OBJECTIVE round with input $INPUT_SYNTH"
         echo "Running independent round work with up to $MAX_JOBS parallel jobs"
 
         # ---------------------------------------------------------
@@ -945,7 +1100,7 @@ run_round() {
                 displ "$VEC_INS" candidate.vec candidate.displ
 
                 local SCORE
-                SCORE=$(rmse candidate.displ "$INPL")
+                SCORE=$(objective_score candidate.displ "$INPL")
 
                 mv candidate.graph "$EVC_DIR/$LABEL.graph"
                 printf '%s|%s\n' "$SCORE" "$EVC_DIR/$LABEL.graph" \
@@ -974,25 +1129,25 @@ run_round() {
         fi
 
         local BEST_EVC_GRAPH="$INPUT_ABS"
-        local BEST_EVC_RMSE="$had_rmse"
-        local CUR_RMSE CUR_GRAPH
+        local BEST_EVC_SCORE="$had_score"
+        local CUR_SCORE CUR_GRAPH
 
         # Read in the original deterministic order so equal scores are handled
         # exactly as they were in the serial version.
         for LABEL in "${EVC_LABELS[@]}"; do
-            IFS='|' read -r CUR_RMSE CUR_GRAPH < "$EVC_DIR/$LABEL.result"
-            echo "$LABEL RMSE = $CUR_RMSE"
+            IFS='|' read -r CUR_SCORE CUR_GRAPH < "$EVC_DIR/$LABEL.result"
+            echo "$LABEL $ROUND_OBJECTIVE = $CUR_SCORE"
 
-            if float_less "$CUR_RMSE" "$BEST_EVC_RMSE"; then
-                BEST_EVC_RMSE="$CUR_RMSE"
+            if float_less "$CUR_SCORE" "$BEST_EVC_SCORE"; then
+                BEST_EVC_SCORE="$CUR_SCORE"
                 BEST_EVC_GRAPH="$CUR_GRAPH"
             fi
         done
 
         if [ "$BEST_EVC_GRAPH" != "$INPUT_ABS" ]; then
-            echo "Replacing $INPUT_SYNTH with the best EVC candidate (RMSE $BEST_EVC_RMSE)"
+            echo "Replacing $INPUT_SYNTH with the best EVC candidate ($ROUND_OBJECTIVE $BEST_EVC_SCORE)"
             cp "$BEST_EVC_GRAPH" "$INPUT_ABS"
-            had_rmse="$BEST_EVC_RMSE"
+            had_score="$BEST_EVC_SCORE"
         else
             echo "No EVC candidate improved the input graph."
         fi
@@ -1067,8 +1222,14 @@ run_round() {
                             exit 1
                         fi
 
-                        "$BXK4F_ABS" "${ec[$VAL]}" "${ec[$VAL2]}" "$CMODE" \
-                            < pair_input.tmp > pair_output.tmp
+                        if [ "$ROUND_OBJECTIVE" = "RSEAS" ]; then
+                            "$BXK4F_ABS" "${ec[$VAL]}" "${ec[$VAL2]}" "$RSEAS_E" \
+                                "${RSEAS_WEIGHTS[@]}" \
+                                < pair_input.tmp > pair_output.tmp
+                        else
+                            "$BXK4F_ABS" "${ec[$VAL]}" "${ec[$VAL2]}" \
+                                < pair_input.tmp > pair_output.tmp
+                        fi
 
                         read -r MAG MAG2 EXPECTED < pair_output.tmp
                         printf '%s|%s|%s|%s|%s\n' \
@@ -1097,8 +1258,8 @@ run_round() {
             cat "$PAIR_DIR/results_$WORKER.txt" >> "$RESULTS_FILE"
         done
 
-        had_rmse=$(rmse "$F0_ABS" "$INPL")
-        echo "RMSE before modification is $had_rmse"
+        had_score=$(objective_score "$F0_ABS" "$INPL")
+        echo "$ROUND_OBJECTIVE before modification is $had_score"
 
         # ---------------------------------------------------------
         # 3. Evaluate the ten most promising pairs in parallel.
@@ -1117,13 +1278,13 @@ run_round() {
         local -a TOP_PIDS=()
         local TOP_FAILED=0
         local RANK LINE
-        local sorted_rmse sorted_VAL sorted_VAL2 sorted_MAG sorted_MAG2
+        local sorted_score sorted_VAL sorted_VAL2 sorted_MAG sorted_MAG2
         local SCALE SCALE2
 
         for IDX in "${!TOP_LINES[@]}"; do
             RANK=$((IDX + 1))
             LINE="${TOP_LINES[$IDX]}"
-            IFS='|' read -r sorted_rmse sorted_VAL sorted_VAL2 sorted_MAG sorted_MAG2 <<< "$LINE"
+            IFS='|' read -r sorted_score sorted_VAL sorted_VAL2 sorted_MAG sorted_MAG2 <<< "$LINE"
 
             SCALE=$(integer_part "$sorted_MAG")
             SCALE2=$(integer_part "$sorted_MAG2")
@@ -1148,7 +1309,7 @@ run_round() {
                 local TARGET="$TARGET_ABS"
                 local STAGE1="candidate_stage1.graph"
                 local FINAL_CANDIDATE="candidate_final.graph"
-                local MAG_FACTOR GOT_RMSE
+                local MAG_FACTOR GOT_SCORE
                 local ADJUSTED_SCALE="$SCALE"
                 local ADJUSTED_SCALE2="$SCALE2"
                 local STAGE1_TESTED_SCALE STAGE1_TESTED_SCALE2
@@ -1161,7 +1322,12 @@ run_round() {
                 ./bnb 4 "$STAGE1" > stage1.vec
                 displ "$VEC_INS" stage1.vec stage1.displ
                 cat "$INP" stage1.displ > scale_input.tmp
-                "$BXK4ONE_ABS" "$CMODE" < scale_input.tmp > scale_output.tmp
+                if [ "$ROUND_OBJECTIVE" = "RSEAS" ]; then
+                    "$BXK4ONE_ABS" "$RSEAS_E" "${RSEAS_WEIGHTS[@]}" \
+                        < scale_input.tmp > scale_output.tmp
+                else
+                    "$BXK4ONE_ABS" < scale_input.tmp > scale_output.tmp
+                fi
 
                 read -r MAG_FACTOR < scale_output.tmp
 
@@ -1179,9 +1345,9 @@ run_round() {
 
                 ./bnb 4 "$FINAL_CANDIDATE" > final.vec
                 displ "$VEC_INS" final.vec final.displ
-                GOT_RMSE=$(rmse final.displ "$INPL")
+                GOT_SCORE=$(objective_score final.displ "$INPL")
 
-                # Preserve the exact graph whose RMSE was measured.  expfy is
+                # Preserve the exact graph whose objective score was measured.  expfy is
                 # randomized, so regenerating later would be slower and could
                 # produce a different graph from the candidate selected here.
                 local SAVED_CANDIDATE
@@ -1192,8 +1358,8 @@ run_round() {
                 # The result file is published only after the graph is safely
                 # in TOP_DIR, so the parent never selects a missing candidate.
                 printf '%s|%s|%s|%s|%s|%s|%s|%s\n' \
-                    "$GOT_RMSE" "$sorted_VAL" "$sorted_VAL2" \
-                    "$FINAL_TESTED_SCALE" "$FINAL_TESTED_SCALE2" "$sorted_rmse" "$RANK" \
+                    "$GOT_SCORE" "$sorted_VAL" "$sorted_VAL2" \
+                    "$FINAL_TESTED_SCALE" "$FINAL_TESTED_SCALE2" "$sorted_score" "$RANK" \
                     "$SAVED_CANDIDATE" \
                     > "$TOP_DIR/result_$(printf '%02d' "$RANK").tmp"
                 mv "$TOP_DIR/result_$(printf '%02d' "$RANK").tmp" \
@@ -1224,9 +1390,9 @@ run_round() {
         local BEST_VAL2=""
         local BEST_MAG=""
         local BEST_MAG2=""
-        local BEST_RMSE=""
+        local BEST_SCORE=""
         local BEST_GRAPH=""
-        local GOT_RMSE EXPECTED_RMSE RESULT_FILE CANDIDATE_GRAPH
+        local GOT_SCORE EXPECTED_SCORE RESULT_FILE CANDIDATE_GRAPH
 
         # Consume results by original rank, preserving the serial tie-breaking.
         for ((RANK=1; RANK<=${#TOP_LINES[@]}; RANK++)); do
@@ -1235,18 +1401,18 @@ run_round() {
                 continue
             fi
 
-            IFS='|' read -r GOT_RMSE sorted_VAL sorted_VAL2 sorted_MAG sorted_MAG2 \
-                EXPECTED_RMSE _ CANDIDATE_GRAPH < "$RESULT_FILE"
+            IFS='|' read -r GOT_SCORE sorted_VAL sorted_VAL2 sorted_MAG sorted_MAG2 \
+                EXPECTED_SCORE _ CANDIDATE_GRAPH < "$RESULT_FILE"
 
             if [ ! -s "$CANDIDATE_GRAPH" ]; then
                 echo "Saved graph for rank $RANK is missing or empty: $CANDIDATE_GRAPH" >&2
                 exit 1
             fi
 
-            echo "VAL=$sorted_VAL,$sorted_VAL2 MAG=$sorted_MAG,MAG2=$sorted_MAG2. expected RMSE=$EXPECTED_RMSE, got RMSE=$GOT_RMSE."
+            echo "VAL=$sorted_VAL,$sorted_VAL2 MAG=$sorted_MAG,MAG2=$sorted_MAG2. expected $ROUND_OBJECTIVE=$EXPECTED_SCORE, got $ROUND_OBJECTIVE=$GOT_SCORE."
 
-            if [ -z "$BEST_RMSE" ] || float_less "$GOT_RMSE" "$BEST_RMSE"; then
-                BEST_RMSE="$GOT_RMSE"
+            if [ -z "$BEST_SCORE" ] || float_less "$GOT_SCORE" "$BEST_SCORE"; then
+                BEST_SCORE="$GOT_SCORE"
                 BEST_VAL="$sorted_VAL"
                 BEST_VAL2="$sorted_VAL2"
                 BEST_MAG="$sorted_MAG"
@@ -1255,15 +1421,15 @@ run_round() {
             fi
         done
 
-        if [ -z "$BEST_RMSE" ]; then
+        if [ -z "$BEST_SCORE" ]; then
             echo "No top-pair candidate completed successfully." >&2
             exit 1
         fi
 
-        echo "Best pair was $BEST_VAL and $BEST_VAL2 with RMSE $BEST_RMSE and parameters $BEST_MAG,$BEST_MAG2"
+        echo "Best pair was $BEST_VAL and $BEST_VAL2 with $ROUND_OBJECTIVE $BEST_SCORE and parameters $BEST_MAG,$BEST_MAG2"
 
-        if float_greater "$BEST_RMSE" "$had_rmse"; then
-            echo "The best evaluated pair was worse than the input (RMSE $had_rmse); keeping the input graph."
+        if float_greater "$BEST_SCORE" "$had_score"; then
+            echo "The best evaluated pair was worse than the input ($ROUND_OBJECTIVE $had_score); keeping the input graph."
             cp "$INPUT_ABS" "$OUTPUT_ABS"
         else
             echo "Using the saved best candidate directly; expfy will not be rerun."
@@ -1311,7 +1477,7 @@ generate_outinp() {
 
                         # expfy/bnb use files in the current directory.  Each candidate gets
                         # a private directory so their temporary files cannot overwrite one another.
-                        for SHARED_FILE in data_middle.txt data_middle1.txt weights4.txt; do
+                        for SHARED_FILE in data_middle.txt data_middle1.txt; do
                                 if [ -f "$ROOT_DIR/$SHARED_FILE" ]; then
                                         cp "$ROOT_DIR/$SHARED_FILE" "$WORK_DIR/$SHARED_FILE"
                                 fi
@@ -1405,31 +1571,48 @@ generate_outinp() {
 CURRENT="$INIT_SYNTH"
 ./bnb 4 "$TARGET" > vecTar.txt
 
+# Phase 1: the requested number of dynamic-weight RSEAS rounds.
 for ((i=1; i<=ROUNDS; i++)); do
-        set_round_constraints "$i"
-
-        if (( i == 5 )); then CMODE=1; fi
-        if (( i == 9 )); then CMODE=2; fi
-        if (( i == 13 )); then CMODE=3; fi
-        if (( i == 17 )); then CMODE=4; fi
-        if (( i == 21 )); then CMODE=5; fi
-        ./bnb 4 "$CURRENT" > vecInS.txt
+    set_round_constraints "$i"
+    ./bnb 4 "$CURRENT" > vecInS.txt
+    set_round_rseas_state "$i" vecInS.txt vecTar.txt
 
     if (( (i-1) % 4 == 0 )); then
-                ./bnb 4 "$CURRENT" > bres.tmp
-                cat data_middle.txt > data_middle1.txt
-                refresh_rare_graphlets data_middle1.txt
+        ./bnb 4 "$CURRENT" > bres.tmp
+        cat data_middle.txt > data_middle1.txt
+        refresh_rare_graphlets data_middle1.txt
         generate_outinp "$CURRENT"
     fi
 
     NEXT="tmp_round${i}.txt"
-    run_round "$CURRENT" "$NEXT"
+    run_round "$CURRENT" "$NEXT" RSEAS
+    CURRENT="$NEXT"
+done
+
+# Phase 2: regenerate transformation probes from the final RSEAS graph, then
+# perform exactly four equal-weight RMSE polishing rounds.  These rounds do not
+# change or consult the accumulated RSEAS weights/error range.
+echo
+echo "Completed $ROUNDS RSEAS rounds. Starting $EXTRA_RMSE_ROUNDS equal-weight RMSE polishing rounds."
+evb="$TIGHTEST_EVB"
+degb="$TIGHTEST_DEGB"
+hdgb="$TIGHTEST_HDGB"
+./bnb 4 "$CURRENT" > vecInS.txt
+cat data_middle.txt > data_middle1.txt
+refresh_rare_graphlets data_middle1.txt
+generate_outinp "$CURRENT"
+
+for ((j=1; j<=EXTRA_RMSE_ROUNDS; j++)); do
+    set_rmse_round_constraints "$j"
+    TOTAL_INDEX=$((ROUNDS + j))
+    NEXT="tmp_round${TOTAL_INDEX}.txt"
+    run_round "$CURRENT" "$NEXT" RMSE
     CURRENT="$NEXT"
 done
 
 cp "$CURRENT" "$FINAL"
 echo
-echo "Final output stored in $FINAL"
+echo "Final output stored in $FINAL after $ROUNDS RSEAS rounds and $EXTRA_RMSE_ROUNDS RMSE rounds."
 rm -f baseline_val_*.txt outinp_val_*.txt synth1_*.txt \
       outinp_l_val_*.txt suminp_val_*.txt bext_val_*.txt \
           inp1l_*.txt synth_base_*.txt tmp_round*.txt PIS*.txt
