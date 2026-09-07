@@ -1,8 +1,8 @@
 #include <bits/stdc++.h>
-#include "rseas_metric.hpp"
+#include "rseas_metric_k45.hpp"
 using namespace std;
 
-using Vec6 = rseas_metric::Vec6;
+using Vec = rseas_metric::Vec;
 
 namespace {
 
@@ -23,25 +23,26 @@ void add_candidate(vector<double>& candidates, double u) {
 }
 
 double score_at(double u,
-                const Vec6& current,
-                const Vec6& target,
-                const Vec6& displacement,
+                const Vec& current,
+                const Vec& target,
+                const Vec& displacement,
                 const rseas_metric::Config& config) {
-    Vec6 signed_errors{};
-    for (int i = 0; i < 6; ++i) {
+    Vec signed_errors(current.size(), 0.0);
+    for (size_t i = 0; i < current.size(); ++i) {
         const double predicted = current[i] + u * displacement[i];
         signed_errors[i] = predicted - target[i];
     }
     return rseas_metric::score(signed_errors, config);
 }
 
-Result find_best_u(const Vec6& current,
-                   const Vec6& target,
-                   const Vec6& displacement,
+Result find_best_u(const Vec& current,
+                   const Vec& target,
+                   const Vec& displacement,
                    const rseas_metric::Config& config) {
-    Vec6 intercept{};
-    Vec6 slope{};
-    for (int i = 0; i < 6; ++i) {
+    const size_t dimension = current.size();
+    Vec intercept(dimension, 0.0);
+    Vec slope(dimension, 0.0);
+    for (size_t i = 0; i < dimension; ++i) {
         intercept[i] = current[i] - target[i];
         slope[i] = displacement[i];
     }
@@ -51,7 +52,7 @@ Result find_best_u(const Vec6& current,
 
     // The active set of squared-hinge terms changes only where a residual is
     // +e or -e. Between consecutive points the objective is one quadratic.
-    for (int i = 0; i < 6; ++i) {
+    for (size_t i = 0; i < dimension; ++i) {
         if (abs(slope[i]) <= EPS) continue;
 
         const double plus_boundary =
@@ -71,16 +72,15 @@ Result find_best_u(const Vec6& current,
     candidates.insert(candidates.end(), region_breaks.begin(),
                       region_breaks.end());
 
-    // Inside the error range, RSEAS is max_i |residual_i| - e. That is the
-    // upper envelope of the twelve signed residual lines, whose minimum occurs
-    // at an endpoint or an intersection of two such lines.
+    // Inside the error range, RSEAS is max_i |residual_i| - e. This is the
+    // upper envelope of the 2*D signed residual lines.
     struct Line {
         double intercept;
         double slope;
     };
     vector<Line> lines;
-    lines.reserve(12);
-    for (int i = 0; i < 6; ++i) {
+    lines.reserve(2 * dimension);
+    for (size_t i = 0; i < dimension; ++i) {
         lines.push_back({intercept[i], slope[i]});
         lines.push_back({-intercept[i], -slope[i]});
     }
@@ -95,8 +95,8 @@ Result find_best_u(const Vec6& current,
         }
     }
 
-    // In each outside interval, find the exact stationary point of the active
-    // weighted quadratic. Midpoints are also candidates for constant pieces.
+    // In every outside interval, find the exact stationary point of the active
+    // weighted quadratic. Midpoints also cover constant pieces.
     for (size_t interval = 0; interval + 1 < region_breaks.size(); ++interval) {
         const double left = region_breaks[interval];
         const double right = region_breaks[interval + 1];
@@ -109,7 +109,7 @@ Result find_best_u(const Vec6& current,
         double denominator = 0.0;
         bool any_active = false;
 
-        for (int i = 0; i < 6; ++i) {
+        for (size_t i = 0; i < dimension; ++i) {
             const double residual_at_midpoint =
                 intercept[i] + slope[i] * midpoint;
             if (abs(residual_at_midpoint) <= config.error_range) {
@@ -118,7 +118,8 @@ Result find_best_u(const Vec6& current,
 
             any_active = true;
             const double sign = residual_at_midpoint > 0.0 ? 1.0 : -1.0;
-            const double q_intercept = sign * intercept[i] - config.error_range;
+            const double q_intercept =
+                sign * intercept[i] - config.error_range;
             const double q_slope = sign * slope[i];
 
             numerator += config.weights[i] * q_slope * q_intercept;
@@ -152,66 +153,99 @@ Result find_best_u(const Vec6& current,
     return best;
 }
 
-bool read_vec6(istream& input, Vec6& values) {
+bool read_vec(istream& input, Vec& values) {
     for (double& value : values) {
         if (!(input >> value)) return false;
     }
     return true;
 }
 
-bool parse_config(char* argv[], rseas_metric::Config& config) {
+bool no_extra_values(istream& input) {
+    input >> ws;
+    return input.eof();
+}
+
+bool parse_int(const char* text, int& value) {
     try {
-        config.error_range = stod(argv[1]);
-        for (int i = 0; i < 6; ++i) {
-            config.weights[i] = stod(argv[2 + i]);
-        }
+        size_t used = 0;
+        const string input(text);
+        value = stoi(input, &used);
+        return used == input.size();
     } catch (const exception&) {
         return false;
     }
+}
 
-    if (!isfinite(config.error_range) || config.error_range < 0.0) {
+bool parse_double(const char* text, double& value) {
+    try {
+        size_t used = 0;
+        const string input(text);
+        value = stod(input, &used);
+        return used == input.size() && isfinite(value);
+    } catch (const exception&) {
         return false;
     }
-    for (double weight : config.weights) {
-        if (!isfinite(weight) || weight <= 0.0) {
-            return false;
-        }
-    }
-    return true;
 }
 
 }  // namespace
 
 int main(int argc, char* argv[]) {
-    if (argc != 8) {
+    if (argc < 2) {
         cerr << "Usage: " << argv[0]
-             << " <error_range> <w1> <w2> <w3> <w4> <w5> <w6>\n";
+             << " <k:4|5> <error_range> <w1> ... <wD>\n";
+        return 1;
+    }
+
+    int k = 0;
+    if (!parse_int(argv[1], k) || (k != 4 && k != 5)) {
+        cerr << "Error: k must be 4 or 5.\n";
+        return 1;
+    }
+    const size_t dimension = rseas_metric::dimension_for_k(k);
+    const int expected_argc = static_cast<int>(3 + dimension);
+    if (argc != expected_argc) {
+        cerr << "Usage: " << argv[0]
+             << " <k:4|5> <error_range> <w1> ... <wD>\n"
+             << "For k=" << k << ", exactly " << dimension
+             << " weights are required.\n";
         return 1;
     }
 
     rseas_metric::Config config;
-    if (!parse_config(argv, config)) {
-        cerr << "Error: error_range must be nonnegative and all six weights "
-                "must be positive finite numbers.\n";
+    config.weights.assign(dimension, 1.0);
+    if (!parse_double(argv[2], config.error_range) ||
+        config.error_range < 0.0) {
+        cerr << "Error: error_range must be a finite nonnegative number.\n";
+        return 1;
+    }
+    for (size_t i = 0; i < dimension; ++i) {
+        if (!parse_double(argv[3 + i], config.weights[i]) ||
+            config.weights[i] <= 0.0) {
+            cerr << "Error: all " << dimension
+                 << " weights must be positive finite numbers.\n";
+            return 1;
+        }
+    }
+
+    Vec current(dimension, 0.0);
+    Vec target(dimension, 0.0);
+    Vec displacement(dimension, 0.0);
+
+    if (!read_vec(cin, current) ||
+        !read_vec(cin, target) ||
+        !read_vec(cin, displacement) ||
+        !no_extra_values(cin)) {
+        cerr << "Error: bxk4one RSEAS expected exactly "
+             << (3 * dimension) << " numeric input values for k="
+             << k << ".\n";
         return 1;
     }
 
-    Vec6 current{};
-    Vec6 target{};
-    Vec6 displacement{};
-
-    if (!read_vec6(cin, current) ||
-        !read_vec6(cin, target) ||
-        !read_vec6(cin, displacement)) {
-        cerr << "Error: incomplete bxk4one input.\n";
-        return 1;
-    }
-
-    for (int i = 0; i < 6; ++i) {
+    for (size_t i = 0; i < dimension; ++i) {
         current[i] = rseas_metric::safe_log(current[i]);
         target[i] = rseas_metric::safe_log(target[i]);
 
-        // rpll writes log(current)-log(stage1). Negating gives the observed
+        // rpll writes log(current)-log(stage1). Negating it gives the observed
         // movement from current toward stage1.
         displacement[i] = -displacement[i];
     }

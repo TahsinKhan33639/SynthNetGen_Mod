@@ -5,10 +5,19 @@
 
 *.tmp
 
-bnb
-bxk4f
-bxk4one
+evc1
+evc2
+evc3
+evs
+expfy
+gen_deg2
+orca
+otb2
 cleanup
-expfc
+bnb
+bxk4f_rseas
+bxk4f_rmse
+bxk4one_rseas
+bxk4one_rmse
 
 build/

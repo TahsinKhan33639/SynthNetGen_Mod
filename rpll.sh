@@ -23,14 +23,14 @@ MAX_APPLY_SAMPLES=100000
 # graph has been cleaned and EFFECTIVE_N is known. TIGHTEST_DEGB is the integer
 # code passed to expfy; expfy divides it by 140, so 14 means a log-degree
 # tolerance of 0.1.
-TIGHTEST_EVB=0.5
+TIGHTEST_EVB=50
 TIGHTEST_DEGB=14
 TIGHTEST_HDGB_REFERENCE=40
-ROUND_BACKWARD_FACTOR=1.25
+ROUND_BACKWARD_FACTOR=1.05
 
-# After the requested RSEAS rounds, run one four-round equal-weight RMSE
-# polishing block.  The command-line round count still means RSEAS rounds.
-EXTRA_RMSE_ROUNDS=4
+# RMSE_ROUNDS and RBGO are command-line parameters. After a round accepts its
+# best pair, refine that same pair this many additional times.
+PAIR_REFINEMENT_PASSES=3
 
 clamp_int() {
     local VALUE="$1"
@@ -80,74 +80,120 @@ float_above_by() {
 # four phase-specific C++ optimizers.
 LOG_FLOOR=-15.0
 
-# Round-level RSEAS state.  The six positions correspond to graphlets
-# 5, 6, 7, 8, 9, and 10, in the order emitted by bnb 4.
+# Graphlet mode is configured after command-line parsing. All scoring vectors
+# have GRAPHLET_DIM coordinates: 6 for k=4 and 21 for k=5. The transformation
+# sampler itself remains based on four-node graphlets.
+GRAPHLET_K=""
+GRAPHLET_DIM=0
+declare -a GRAPHLET_IDS=()
+PAIR_INPUT_WORDS_EXPECTED=0
+OUTINP_WORDS_EXPECTED=0
+SCALE_INPUT_WORDS_EXPECTED=0
+RSEAS_WEIGHT_INCREMENT=1
+
+# Round-level RSEAS state.
 RSEAS_E=0.0
 RSEAS_E_INITIALIZED=0
-RSEAS_WEIGHTS=(1 1 4 30 1 2)
-PREVIOUS_WORST_GRAPHLET=""
+declare -a RSEAS_WEIGHTS=()
+PREVIOUS_WORST_INDEX=""
+
+configure_graphlet_mode() {
+    case "$GRAPHLET_K" in
+        4)
+            GRAPHLET_DIM=6
+            GRAPHLET_IDS=(5 6 7 8 9 10)
+            # Preserve the current k=4 starting weights.
+            RSEAS_WEIGHTS=(1 1 1 1 1 1)
+            RSEAS_WEIGHT_INCREMENT=1
+            ;;
+        5)
+            GRAPHLET_DIM=21
+            # bnb 5 emits these 21 graphlet IDs in this order.
+            GRAPHLET_IDS=(4 10 11 14 15 16 17 18 19 22 23 24 25 26 27 28 29 30 31 32 33)
+            RSEAS_WEIGHTS=()
+            for ((GRAPHLET_INDEX=0; GRAPHLET_INDEX<GRAPHLET_DIM; GRAPHLET_INDEX++)); do
+                RSEAS_WEIGHTS+=(1)
+            done
+            RSEAS_WEIGHT_INCREMENT=3
+            ;;
+        *)
+            echo "Graphlet size k must be 4 or 5, not '$GRAPHLET_K'." >&2
+            exit 1
+            ;;
+    esac
+
+    PAIR_INPUT_WORDS_EXPECTED=$((6 * GRAPHLET_DIM + 4))
+    OUTINP_WORDS_EXPECTED=$((2 * GRAPHLET_DIM + 2))
+    SCALE_INPUT_WORDS_EXPECTED=$((3 * GRAPHLET_DIM))
+}
 
 # Log displacement: log(A)-log(B), using LOG_FLOOR for a zero frequency.
 displ() {
-    python3 - "$1" "$2" "$3" "$LOG_FLOOR" << 'EOF_PY'
+    python3 - "$1" "$2" "$3" "$LOG_FLOOR" "$GRAPHLET_DIM" << 'EOF_PY'
 import math
 import sys
 
-path_a, path_b, output_path, log_floor_text = sys.argv[1:5]
+path_a, path_b, output_path, log_floor_text, dimension_text = sys.argv[1:6]
 log_floor = float(log_floor_text)
+dimension = int(dimension_text)
 
 A = [float(x) for x in open(path_a, encoding="utf-8").read().split()]
 B = [float(x) for x in open(path_b, encoding="utf-8").read().split()]
-if len(A) < 6 or len(B) < 6:
-    raise SystemExit("Expected at least six graphlet-frequency values")
+if len(A) != dimension or len(B) != dimension:
+    raise SystemExit(
+        f"Expected exactly {dimension} graphlet-frequency values; got {len(A)} and {len(B)}"
+    )
 
 def safe_log(value):
     return math.log(value) if value > 0.0 else log_floor
 
-diff = [safe_log(A[i]) - safe_log(B[i]) for i in range(6)]
+diff = [safe_log(A[i]) - safe_log(B[i]) for i in range(dimension)]
 open(output_path, "w", encoding="utf-8").write(
     " ".join(format(value, ".17g") for value in diff) + "\n"
 )
 EOF_PY
 }
 
-# Score two six-coordinate displacement vectors with one fixed RSEAS state.
-# The caller supplies e followed by six positive weights.
+# Score two GRAPHLET_DIM-coordinate displacement vectors with one fixed RSEAS
+# state. The caller supplies e followed by one positive weight per coordinate.
 rseas_with_config() {
     local FILE_A="$1"
     local FILE_B="$2"
     local ERROR_RANGE="$3"
     shift 3
 
-    if (( $# != 6 )); then
-        echo "rseas_with_config requires exactly six weights." >&2
+    if (( $# != GRAPHLET_DIM )); then
+        echo "rseas_with_config requires exactly $GRAPHLET_DIM weights for k=$GRAPHLET_K." >&2
         return 1
     fi
 
-    python3 - "$FILE_A" "$FILE_B" "$ERROR_RANGE" "$@" << 'EOF_PY'
+    python3 - "$FILE_A" "$FILE_B" "$ERROR_RANGE" "$GRAPHLET_DIM" "$@" << 'EOF_PY'
 import math
 import sys
 
 path_a, path_b = sys.argv[1:3]
 error_range = float(sys.argv[3])
-weights = [float(x) for x in sys.argv[4:10]]
+dimension = int(sys.argv[4])
+weights = [float(x) for x in sys.argv[5:]]
 
 A = [float(x) for x in open(path_a, encoding="utf-8").read().split()]
 B = [float(x) for x in open(path_b, encoding="utf-8").read().split()]
-if len(A) < 6 or len(B) < 6:
-    raise SystemExit("Expected at least six values in each RSEAS vector")
+if len(A) < dimension or len(B) < dimension:
+    raise SystemExit(
+        f"Expected at least {dimension} values in each RSEAS vector; got {len(A)} and {len(B)}"
+    )
 if not math.isfinite(error_range) or error_range < 0.0:
     raise SystemExit("RSEAS error range must be a finite nonnegative number")
-if len(weights) != 6 or any((not math.isfinite(w) or w <= 0.0) for w in weights):
-    raise SystemExit("RSEAS requires six positive finite weights")
+if len(weights) != dimension or any((not math.isfinite(w) or w <= 0.0) for w in weights):
+    raise SystemExit(f"RSEAS requires {dimension} positive finite weights")
 
-distances = [abs(A[i] - B[i]) for i in range(6)]
+distances = [abs(A[i] - B[i]) for i in range(dimension)]
 maximum_distance = max(distances)
 
 if any(distance > error_range for distance in distances):
     result = sum(
         weights[i] * max(0.0, distances[i] - error_range) ** 2
-        for i in range(6)
+        for i in range(dimension)
     )
 else:
     result = maximum_distance - error_range
@@ -160,22 +206,23 @@ rseas() {
     rseas_with_config "$1" "$2" "$RSEAS_E" "${RSEAS_WEIGHTS[@]}"
 }
 
-# Equal-weight RMSE used in the old pipeline.  With six unit weights this is
-# sqrt(sum_i (A_i-B_i)^2).  The missing division by six is retained deliberately
-# so reported values remain comparable with earlier runs; it does not affect
-# candidate ordering or the optimizer's chosen scales.
+# Equal-weight RMSE used in the polishing phase. This preserves the existing
+# convention sqrt(sum_i (A_i-B_i)^2), now over GRAPHLET_DIM coordinates.
 unit_rmse() {
-    python3 - "$1" "$2" << 'EOF_PY'
+    python3 - "$1" "$2" "$GRAPHLET_DIM" << 'EOF_PY'
 import math
 import sys
 
 path_a, path_b = sys.argv[1:3]
+dimension = int(sys.argv[3])
 A = [float(x) for x in open(path_a, encoding="utf-8").read().split()]
 B = [float(x) for x in open(path_b, encoding="utf-8").read().split()]
-if len(A) < 6 or len(B) < 6:
-    raise SystemExit("Expected at least six values in each RMSE vector")
+if len(A) < dimension or len(B) < dimension:
+    raise SystemExit(
+        f"Expected at least {dimension} values in each RMSE vector; got {len(A)} and {len(B)}"
+    )
 
-value = sum((A[i] - B[i]) ** 2 for i in range(6))
+value = sum((A[i] - B[i]) ** 2 for i in range(dimension))
 print(format(math.sqrt(value), ".17g"))
 EOF_PY
 }
@@ -193,36 +240,45 @@ objective_score() {
     esac
 }
 
-# Print: worst_graphlet max_log_error candidate_error_range. The candidate
-# range is 0.75*max_log_error; set_round_rseas_state then caps it at the
-# preceding round's e. Ties are broken by taking the first coordinate, so
-# graphlet 5 wins a complete tie, then 6, and so on.
+# Print: worst_index worst_graphlet_id max_log_error candidate_error_range.
+# The candidate range is 0.75*max_log_error; set_round_rseas_state then caps it
+# at the preceding round's e. Ties are broken by the first emitted coordinate.
 log_error_summary() {
-    python3 - "$1" "$2" "$LOG_FLOOR" << 'EOF_PY'
+    local GRAPHLET_ID_CSV
+    GRAPHLET_ID_CSV=$(IFS=,; echo "${GRAPHLET_IDS[*]}")
+
+    python3 - "$1" "$2" "$LOG_FLOOR" "$GRAPHLET_DIM" "$GRAPHLET_ID_CSV" << 'EOF_PY'
 import math
 import sys
 
-current_path, target_path, log_floor_text = sys.argv[1:4]
+current_path, target_path, log_floor_text, dimension_text, graphlet_ids_text = sys.argv[1:6]
 log_floor = float(log_floor_text)
+dimension = int(dimension_text)
+graphlet_ids = [int(x) for x in graphlet_ids_text.split(",") if x]
 
 current = [float(x) for x in open(current_path, encoding="utf-8").read().split()]
 target = [float(x) for x in open(target_path, encoding="utf-8").read().split()]
-if len(current) < 6 or len(target) < 6:
-    raise SystemExit("Expected six graphlet frequencies when deriving RSEAS state")
+if len(current) != dimension or len(target) != dimension:
+    raise SystemExit(
+        f"Expected exactly {dimension} graphlet frequencies; got {len(current)} and {len(target)}"
+    )
+if len(graphlet_ids) != dimension:
+    raise SystemExit("Internal graphlet-ID list has the wrong length")
 
 def safe_log(value):
     return math.log(value) if value > 0.0 else log_floor
 
 distances = [
     abs(safe_log(current[i]) - safe_log(target[i]))
-    for i in range(6)
+    for i in range(dimension)
 ]
-worst_index = max(range(6), key=lambda index: distances[index])
+worst_index = max(range(dimension), key=lambda index: distances[index])
 maximum_distance = distances[worst_index]
 error_range = 0.75 * maximum_distance
 
 print(
-    worst_index + 5,
+    worst_index,
+    graphlet_ids[worst_index],
     format(maximum_distance, ".17g"),
     format(error_range, ".17g"),
 )
@@ -233,22 +289,24 @@ set_round_rseas_state() {
     local ROUND_INDEX="$1"
     local CURRENT_VEC="$2"
     local TARGET_VEC="$3"
-    local WORST_GRAPHLET MAX_ERROR NEW_ERROR_RANGE WEIGHT_INDEX
+    local WORST_INDEX WORST_GRAPHLET MAX_ERROR NEW_ERROR_RANGE WEIGHT_INDEX
     local PREVIOUS_ERROR_RANGE=""
     local REPEATED_TEXT=""
     local ERROR_RANGE_TEXT=""
 
-    read -r WORST_GRAPHLET MAX_ERROR NEW_ERROR_RANGE \
+    read -r WORST_INDEX WORST_GRAPHLET MAX_ERROR NEW_ERROR_RANGE \
         < <(log_error_summary "$CURRENT_VEC" "$TARGET_VEC")
 
-    WEIGHT_INDEX=$((WORST_GRAPHLET - 5))
-    if [[ -n "$PREVIOUS_WORST_GRAPHLET" && \
-          "$WORST_GRAPHLET" == "$PREVIOUS_WORST_GRAPHLET" ]]; then
-        RSEAS_WEIGHTS[$WEIGHT_INDEX]=$((RSEAS_WEIGHTS[$WEIGHT_INDEX] + 1))
-        REPEATED_TEXT="; repeated worst graphlet, increased its weight"
+    WEIGHT_INDEX="$WORST_INDEX"
+    if [[ -n "$PREVIOUS_WORST_INDEX" && \
+          "$WORST_INDEX" == "$PREVIOUS_WORST_INDEX" ]]; then
+        RSEAS_WEIGHTS[$WEIGHT_INDEX]=$((
+            RSEAS_WEIGHTS[$WEIGHT_INDEX] + RSEAS_WEIGHT_INCREMENT
+        ))
+        REPEATED_TEXT="; repeated worst graphlet, increased its weight by $RSEAS_WEIGHT_INCREMENT"
     fi
 
-    PREVIOUS_WORST_GRAPHLET="$WORST_GRAPHLET"
+    PREVIOUS_WORST_INDEX="$WORST_INDEX"
 
     # The first RSEAS round has no preceding e. After that, e is monotone
     # nonincreasing:
@@ -279,8 +337,8 @@ configure_node_scaled_parameters() {
         echo "Could not determine the node count from $TARGET." >&2
         exit 1
     fi
-    if (( NODE_COUNT < 4 )); then
-        echo "The cleaned target must contain at least 4 nodes." >&2
+    if (( NODE_COUNT < GRAPHLET_K )); then
+        echo "The cleaned target must contain at least $GRAPHLET_K nodes for k=$GRAPHLET_K." >&2
         exit 1
     fi
 
@@ -379,43 +437,68 @@ set_rmse_round_constraints() {
     local ROUND_INDEX="$1"
 
     # The RSEAS schedule already reaches these tightest values on its last
-    # round.  Keep them fixed during all four appended polishing rounds.
+    # round. Keep them fixed during every appended polishing round.
     evb="$TIGHTEST_EVB"
     degb="$TIGHTEST_DEGB"
     hdgb="$TIGHTEST_HDGB"
 
-    echo "RMSE polishing round $ROUND_INDEX/$EXTRA_RMSE_ROUNDS constraints: evb=$evb, degb=$degb, hdgb=$hdgb"
+    echo "RMSE polishing round $ROUND_INDEX/$RMSE_ROUNDS constraints: evb=$evb, degb=$degb, hdgb=$hdgb"
 }
 
 INITIAL_GRAPH_GIVEN=0
 
-if [ $# -eq 3 ]; then
-    TARGET0="$1"
-    FINAL="$2"
-    ROUNDS="$3"
-    PRE_INIT_SYNTH=""
-elif [ $# -eq 4 ]; then
-    TARGET0="$1"
-    FINAL="$2"
-    PRE_INIT_SYNTH="$3"
+if [ $# -eq 6 ]; then
+    GRAPHLET_K="$1"
+    TARGET0="$2"
+    FINAL="$3"
     ROUNDS="$4"
+    RMSE_ROUNDS="$5"
+    RBGO="$6"
+    PRE_INIT_SYNTH=""
+elif [ $# -eq 7 ]; then
+    GRAPHLET_K="$1"
+    TARGET0="$2"
+    FINAL="$3"
+    PRE_INIT_SYNTH="$4"
+    ROUNDS="$5"
+    RMSE_ROUNDS="$6"
+    RBGO="$7"
     INITIAL_GRAPH_GIVEN=1
 else
-    echo "Usage: $0 <Target> <Output> <Rounds> | $0 <Target> <Output> <Base_Synth> <Rounds>"
+    echo "Usage: $0 <k:4|5> <Target> <Output> <RSEAS_Rounds> <RMSE_Rounds> <RBGO>"
+    echo "   or: $0 <k:4|5> <Target> <Output> <Base_Synth> <RSEAS_Rounds> <RMSE_Rounds> <RBGO>"
+    exit 1
+fi
+echo "$TARGET0" >> wcic.txt
+
+if ! [[ "$GRAPHLET_K" =~ ^[45]$ ]]; then
+    echo "Graphlet size k must be 4 or 5, not '$GRAPHLET_K'." >&2
+    exit 1
+fi
+if ! [[ "$ROUNDS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "RSEAS rounds must be a positive integer, not '$ROUNDS'." >&2
+    exit 1
+fi
+if ! [[ "$RMSE_ROUNDS" =~ ^[0-9]+$ ]]; then
+    echo "RMSE rounds must be a nonnegative integer, not '$RMSE_ROUNDS'." >&2
+    exit 1
+fi
+if ! [[ "$RBGO" =~ ^[1-9][0-9]*$ ]]; then
+    echo "RBGO must be a positive integer, not '$RBGO'." >&2
     exit 1
 fi
 
-if ! [[ "$ROUNDS" =~ ^[1-9][0-9]*$ ]]; then
-    echo "Rounds must be a positive integer, not '$ROUNDS'." >&2
-    exit 1
-fi
+configure_graphlet_mode
+
+echo "Optimizing k=$GRAPHLET_K graphlets with $GRAPHLET_DIM frequency coordinates."
+echo "Schedule: $ROUNDS RSEAS rounds, $RMSE_ROUNDS RMSE rounds, regenerate transformation probes every $RBGO round(s) within each phase."
 
 TARGET="target_c.txt"
 ./cleanup "$TARGET0" "$TARGET"
 configure_node_scaled_parameters
 build_round_constraint_schedule
 
-if [ $# -eq 3 ]; then
+if (( ! INITIAL_GRAPH_GIVEN )); then
     ./gen_deg2 "$TARGET" synth_base_1.txt
 
     ./bnb 4 synth_base_1.txt > bres.tmp
@@ -452,14 +535,16 @@ else
     fi
 fi
 
-# When a base synth was supplied by the user, each complete PIS candidate is
-# accepted only when its RSEAS is no greater than that of the last accepted
-# graph. PIS is outside the optimization rounds, so it uses six unit weights
-# and one error range fixed from the graph entering PIS.
+# PIS uses one target vector, unit weights, and one error range fixed from the
+# graph entering PIS.  The state is initialized for both generated and supplied
+# base graphs because evc1 and evc3 must be compared under the same objective.
 PIS_TARGET_VEC="pis_target_vec.tmp"
 PIS_CURRENT_RSEAS=""
 PIS_RSEAS_E=0.0
-PIS_RSEAS_WEIGHTS=(1 1 1 1 1 1)
+declare -a PIS_RSEAS_WEIGHTS=()
+for ((GRAPHLET_INDEX=0; GRAPHLET_INDEX<GRAPHLET_DIM; GRAPHLET_INDEX++)); do
+    PIS_RSEAS_WEIGHTS+=(1)
+done
 
 pis_graph_rseas() {
     local GRAPH="$1"
@@ -467,7 +552,7 @@ pis_graph_rseas() {
 
     VEC_FILE=$(mktemp ".pis_vec.XXXXXX")
     DISPL_FILE=$(mktemp ".pis_displ.XXXXXX")
-    if ! ./bnb 4 "$GRAPH" > "$VEC_FILE"; then
+    if ! ./bnb "$GRAPHLET_K" "$GRAPH" > "$VEC_FILE"; then
         rm -f "$VEC_FILE" "$DISPL_FILE"
         return 1
     fi
@@ -490,13 +575,8 @@ accept_pis_candidate() {
     local OUTPUT="$3"
     local LABEL="$4"
 
-    if (( ! INITIAL_GRAPH_GIVEN )); then
-        mv "$CANDIDATE" "$OUTPUT"
-        return
-    fi
-
     # The threshold branch can deliberately produce an exact copy. Do not
-    # re-sample the same graph and accidentally change the remembered score.
+    # resample it and accidentally perturb the remembered score.
     if cmp -s "$BEFORE" "$CANDIDATE"; then
         mv "$CANDIDATE" "$OUTPUT"
         echo "$LABEL made no change; RSEAS remains $PIS_CURRENT_RSEAS."
@@ -508,7 +588,14 @@ accept_pis_candidate() {
 
     echo "$LABEL RSEAS: before=$PIS_CURRENT_RSEAS, candidate=$CANDIDATE_RSEAS"
 
-    if awk -v NEW="$CANDIDATE_RSEAS" -v OLD="$PIS_CURRENT_RSEAS" \
+    # Preserve the existing behavior for an automatically generated base: the
+    # PIS transformation is applied directly.  For a user-supplied base, reject
+    # a candidate that worsens the fixed PIS objective.
+    if (( ! INITIAL_GRAPH_GIVEN )); then
+        mv "$CANDIDATE" "$OUTPUT"
+        PIS_CURRENT_RSEAS="$CANDIDATE_RSEAS"
+        echo "$LABEL accepted."
+    elif awk -v NEW="$CANDIDATE_RSEAS" -v OLD="$PIS_CURRENT_RSEAS" \
         'BEGIN { exit !(NEW <= OLD) }'; then
         mv "$CANDIDATE" "$OUTPUT"
         PIS_CURRENT_RSEAS="$CANDIDATE_RSEAS"
@@ -520,25 +607,60 @@ accept_pis_candidate() {
     fi
 }
 
-if (( INITIAL_GRAPH_GIVEN )); then
-    local_pis_initial_vec=$(mktemp ".pis_initial_vec.XXXXXX")
-    local_pis_initial_displ=$(mktemp ".pis_initial_displ.XXXXXX")
+# When the current eigenvalue is too small, both evc1 and evc2 move it in the
+# required direction. Generate both from the same input using the same sample
+# count, then pass the lower-RSEAS candidate to the normal PIS acceptance rule.
+make_pis_increase_candidate() {
+    local INPUT_GRAPH="$1"
+    local NUM_SAMPLES="$2"
+    local LABEL="$3"
+    local OUTPUT_CANDIDATE="$4"
 
-    ./bnb 4 "$TARGET" > "$PIS_TARGET_VEC"
-    ./bnb 4 "$PRE_INIT_SYNTH" > "$local_pis_initial_vec"
+    local EVC1_CANDIDATE="${LABEL}_evc1_candidate.txt"
+    local EVC2_CANDIDATE="${LABEL}_evc2_candidate.txt"
+    local EVC1_SCORE EVC2_SCORE
 
-    read -r PIS_WORST_GRAPHLET PIS_MAX_ERROR PIS_RSEAS_E \
-        < <(log_error_summary "$local_pis_initial_vec" "$PIS_TARGET_VEC")
+    ./evc1 "$INPUT_GRAPH" "$NUM_SAMPLES" > "$EVC1_CANDIDATE"
+    ./evc2 "$INPUT_GRAPH" "$NUM_SAMPLES" > "$EVC2_CANDIDATE"
 
-    displ "$local_pis_initial_vec" "$PIS_TARGET_VEC" "$local_pis_initial_displ"
-    PIS_CURRENT_RSEAS=$(rseas_with_config f0.txt "$local_pis_initial_displ" \
-        "$PIS_RSEAS_E" "${PIS_RSEAS_WEIGHTS[@]}")
+    EVC1_SCORE=$(pis_graph_rseas "$EVC1_CANDIDATE")
+    EVC2_SCORE=$(pis_graph_rseas "$EVC2_CANDIDATE")
 
-    rm -f "$local_pis_initial_vec" "$local_pis_initial_displ"
+    echo "$LABEL eigenvalue-increase candidates: evc1 RSEAS=$EVC1_SCORE, evc2 RSEAS=$EVC2_SCORE"
 
-    echo "PIS RSEAS state: worst graphlet=$PIS_WORST_GRAPHLET, max log error=$PIS_MAX_ERROR, e=$PIS_RSEAS_E, weights=${PIS_RSEAS_WEIGHTS[*]}"
-    echo "Initial graph RSEAS before PIS: $PIS_CURRENT_RSEAS"
-fi
+    # Prefer evc1 on an exact tie so the old PIS behavior remains the stable
+    # tie-breaker. evc3 is selected only when its measured RSEAS is lower.
+    if awk -v EVC2="$EVC2_SCORE" -v EVC1="$EVC1_SCORE" \
+        'BEGIN { exit !(EVC2 < EVC1) }'; then
+        mv "$EVC2_CANDIDATE" "$OUTPUT_CANDIDATE"
+        rm -f "$EVC1_CANDIDATE"
+        echo "$LABEL selected evc2."
+    else
+        mv "$EVC1_CANDIDATE" "$OUTPUT_CANDIDATE"
+        rm -f "$EVC2_CANDIDATE"
+        echo "$LABEL selected evc1."
+    fi
+}
+
+# Initialize the fixed PIS objective for every run. This is needed even for a
+# generated base so evc1 and evc3 can be compared fairly.
+local_pis_initial_vec=$(mktemp ".pis_initial_vec.XXXXXX")
+local_pis_initial_displ=$(mktemp ".pis_initial_displ.XXXXXX")
+
+./bnb "$GRAPHLET_K" "$TARGET" > "$PIS_TARGET_VEC"
+./bnb "$GRAPHLET_K" "$PRE_INIT_SYNTH" > "$local_pis_initial_vec"
+
+read -r PIS_WORST_INDEX PIS_WORST_GRAPHLET PIS_MAX_ERROR PIS_RSEAS_E \
+    < <(log_error_summary "$local_pis_initial_vec" "$PIS_TARGET_VEC")
+
+displ "$local_pis_initial_vec" "$PIS_TARGET_VEC" "$local_pis_initial_displ"
+PIS_CURRENT_RSEAS=$(rseas_with_config f0.txt "$local_pis_initial_displ" \
+    "$PIS_RSEAS_E" "${PIS_RSEAS_WEIGHTS[@]}")
+
+rm -f "$local_pis_initial_vec" "$local_pis_initial_displ"
+
+echo "PIS RSEAS state: worst graphlet=$PIS_WORST_GRAPHLET, max log error=$PIS_MAX_ERROR, e=$PIS_RSEAS_E, weights=${PIS_RSEAS_WEIGHTS[*]}"
+echo "Initial graph RSEAS before PIS: $PIS_CURRENT_RSEAS"
 
 PIS1_CANDIDATE="PIS1_candidate.txt"
 ./evs "$PRE_INIT_SYNTH" > evh.txt
@@ -546,7 +668,7 @@ read EV1 < evh.txt
 ./evs "$TARGET" > evh.txt
 read EV2 < evh.txt
 if float_below_by "$EV1" "$EV2" 14; then
-    ./evc1 "$PRE_INIT_SYNTH" "$PIS1_SAMPLES" > "$PIS1_CANDIDATE"
+    make_pis_increase_candidate "$PRE_INIT_SYNTH" "$PIS1_SAMPLES" PIS1 "$PIS1_CANDIDATE"
 elif float_above_by "$EV1" "$EV2" 14; then
     ./evc2 "$PRE_INIT_SYNTH" "$PIS1_SAMPLES" > "$PIS1_CANDIDATE"
 else
@@ -560,7 +682,7 @@ read EV1 < evh.txt
 read EV2 < evh.txt
 PIS2_CANDIDATE="PIS2_candidate.txt"
 if float_below_by "$EV1" "$EV2" 7; then
-    ./evc1 PIS1.txt "$PIS2_SAMPLES" > "$PIS2_CANDIDATE"
+    make_pis_increase_candidate PIS1.txt "$PIS2_SAMPLES" PIS2 "$PIS2_CANDIDATE"
 elif float_above_by "$EV1" "$EV2" 7; then
     ./evc2 PIS1.txt "$PIS2_SAMPLES" > "$PIS2_CANDIDATE"
 else
@@ -574,7 +696,7 @@ read EV1 < evh.txt
 read EV2 < evh.txt
 PIS3_CANDIDATE="PIS3_candidate.txt"
 if float_below_by "$EV1" "$EV2" 2; then
-    ./evc1 PIS2.txt "$PIS3_SAMPLES" > "$PIS3_CANDIDATE"
+    make_pis_increase_candidate PIS2.txt "$PIS3_SAMPLES" PIS3 "$PIS3_CANDIDATE"
 elif float_above_by "$EV1" "$EV2" 2; then
     ./evc2 PIS2.txt "$PIS3_SAMPLES" > "$PIS3_CANDIDATE"
 else
@@ -710,6 +832,96 @@ float_less() {
 
 float_greater() {
     awk -v A="$1" -v B="$2" 'BEGIN { exit !(A > B) }'
+}
+
+# Read the output of `evs graph > file`. The gate relies on evs writing one
+# finite floating-point value and nothing else to stdout.
+read_single_eigenvalue() {
+    local FILE="$1"
+    local LABEL="$2"
+
+    python3 - "$FILE" "$LABEL" << 'EOF_PY'
+import math
+import sys
+
+path, label = sys.argv[1:3]
+values = open(path, "r", encoding="utf-8").read().split()
+if len(values) != 1:
+    raise SystemExit(
+        f"{label} eigenvalue output must contain exactly one value; "
+        f"found {len(values)} in {path}"
+    )
+
+try:
+    value = float(values[0])
+except ValueError as error:
+    raise SystemExit(f"Invalid {label} eigenvalue {values[0]!r}: {error}")
+
+if not math.isfinite(value):
+    raise SystemExit(f"{label} eigenvalue must be finite, got {value}")
+
+print(format(value, ".17g"))
+EOF_PY
+}
+
+# Print:
+#   status|after_log_distance|current_log_distance|near_target_limit|reason
+#
+# An EVC candidate is allowed precisely when
+#
+#   |log(target_ev)-log(|after_ev|)| < 0.2*evb
+#
+# or when it is strictly closer to the target eigenvalue than the current
+# graph. The absolute value applies to after_ev exactly as specified.
+evc_eigenvalue_gate() {
+    local TARGET_EV="$1"
+    local CURRENT_EV="$2"
+    local AFTER_EV="$3"
+    local EVB="$4"
+
+    python3 - "$TARGET_EV" "$CURRENT_EV" "$AFTER_EV" "$EVB" << 'EOF_PY'
+import math
+import sys
+
+target_ev, current_ev, after_ev, evb = map(float, sys.argv[1:5])
+
+if not all(math.isfinite(value) for value in (target_ev, current_ev, after_ev, evb)):
+    raise SystemExit("Eigenvalue gate received a non-finite value")
+if target_ev <= 0.0:
+    raise SystemExit(f"Target largest eigenvalue must be positive, got {target_ev}")
+if current_ev <= 0.0:
+    raise SystemExit(f"Current largest eigenvalue must be positive, got {current_ev}")
+if evb < 0.0:
+    raise SystemExit(f"evb must be nonnegative, got {evb}")
+
+after_abs = abs(after_ev)
+current_distance = abs(math.log(target_ev) - math.log(current_ev))
+near_target_limit = 0.002 * evb
+
+if after_abs <= 0.0:
+    print(
+        "DISALLOWED|inf|"
+        f"{current_distance:.17g}|{near_target_limit:.17g}|nonpositive_after_ev"
+    )
+    raise SystemExit(0)
+
+after_distance = abs(math.log(target_ev) - math.log(after_abs))
+
+if after_distance < near_target_limit:
+    status = "ALLOWED"
+    reason = "within_0.2_evb"
+elif after_distance < current_distance:
+    status = "ALLOWED"
+    reason = "closer_than_current"
+else:
+    status = "DISALLOWED"
+    reason = "too_far_and_not_closer"
+
+print(
+    f"{status}|{after_distance:.17g}|{current_distance:.17g}|"
+    f"{near_target_limit:.17g}|{reason}"
+)
+EOF_PY
 }
 
 integer_part() {
@@ -1032,13 +1244,14 @@ run_round() {
         fi
 
         local INPUT_ABS OUTPUT_ABS TARGET_ABS VEC_TAR_ABS F0_ABS
-        local BNB_ABS BXK4F_ABS BXK4ONE_ABS
+        local BNB_ABS EVS_ABS BXK4F_ABS BXK4ONE_ABS
         INPUT_ABS=$(realpath "$INPUT_SYNTH")
         OUTPUT_ABS=$(realpath -m "$OUTPUT_SYNTH")
         TARGET_ABS=$(realpath "$TARGET")
         VEC_TAR_ABS=$(realpath vecTar.txt)
         F0_ABS=$(realpath f0.txt)
         BNB_ABS=$(realpath ./bnb)
+        EVS_ABS=$(realpath ./evs)
         if [ "$ROUND_OBJECTIVE" = "RSEAS" ]; then
             BXK4F_ABS=$(realpath ./bxk4f_rseas)
             BXK4ONE_ABS=$(realpath ./bxk4one_rseas)
@@ -1055,7 +1268,8 @@ run_round() {
         local INPL="$ROOT_DIR/inpl.txt"
         local INP="$ROOT_DIR/inp.txt"
 
-        "$BNB_ABS" 4 "$INPUT_ABS" > "$VEC_INS"
+        "$BNB_ABS" "$GRAPHLET_K" "$INPUT_ABS" > "$VEC_INS"
+        "$BNB_ABS" 4 "$INPUT_ABS" > "$ROOT_DIR/bres.tmp"
         cp "$ROOT_DIR/data_middle.txt" "$ROOT_DIR/data_middle1.txt"
 
         displ "$VEC_INS" "$VEC_TAR_ABS" "$INPL"
@@ -1068,14 +1282,47 @@ run_round() {
         echo "Running independent round work with up to $MAX_JOBS parallel jobs"
 
         # ---------------------------------------------------------
-        # 1. Generate and evaluate the four EVC candidates in parallel.
+        # 1. Generate and evaluate six EVC candidates in parallel: small and
+        #    large runs of evc1, evc2, and the union/intersection evc3.
         # ---------------------------------------------------------
         local EVC_DIR="$ROUND_DIR/evc"
         mkdir -p "$EVC_DIR"
 
-        local -a EVC_LABELS=(outpev11 outpev12 outpev21 outpev22)
-        local -a EVC_TOOLS=(evc1 evc1 evc2 evc2)
+        # Compute the fixed target/current reference once for this round. Each
+        # EVC worker computes only its own after-change eigenvalue.
+        local TARGET_EV_FILE="$EVC_DIR/target.ev"
+        local CURRENT_EV_FILE="$EVC_DIR/current.ev"
+        local TARGET_EV CURRENT_EV EVC_REFERENCE
+        local EVC_REFERENCE_STATUS EVC_REFERENCE_AFTER_DISTANCE
+        local CURRENT_EV_DISTANCE EVC_DISTANCE_LIMIT EVC_REFERENCE_REASON
+
+        "$EVS_ABS" "$TARGET_ABS" > "$TARGET_EV_FILE"
+        "$EVS_ABS" "$INPUT_ABS" > "$CURRENT_EV_FILE"
+        TARGET_EV=$(read_single_eigenvalue "$TARGET_EV_FILE" "target")
+        CURRENT_EV=$(read_single_eigenvalue "$CURRENT_EV_FILE" "current")
+
+        # Reuse the candidate-gate calculation to obtain the round's current
+        # log-distance and its absolute 0.2*evb threshold.
+        EVC_REFERENCE=$(evc_eigenvalue_gate \
+            "$TARGET_EV" "$CURRENT_EV" "$CURRENT_EV" "$evb")
+        IFS='|' read -r EVC_REFERENCE_STATUS EVC_REFERENCE_AFTER_DISTANCE \
+            CURRENT_EV_DISTANCE EVC_DISTANCE_LIMIT EVC_REFERENCE_REASON \
+            <<< "$EVC_REFERENCE"
+
+        echo "EVC eigenvalue gate: target_ev=$TARGET_EV, current_ev=$CURRENT_EV, current_log_distance=$CURRENT_EV_DISTANCE, near_target_limit=$EVC_DISTANCE_LIMIT"
+
+        local -a EVC_LABELS=(
+            outpev11 outpev12
+            outpev21 outpev22
+            outpev31 outpev32
+        )
+        local -a EVC_TOOLS=(
+            evc1 evc1
+            evc2 evc2
+            evc3 evc3
+        )
         local -a EVC_AMOUNTS=(
+            "$OUTPEV_SMALL_SAMPLES" "$OUTPEV_LARGE_SAMPLES"
             "$OUTPEV_SMALL_SAMPLES" "$OUTPEV_LARGE_SAMPLES"
             "$OUTPEV_SMALL_SAMPLES" "$OUTPEV_LARGE_SAMPLES"
         )
@@ -1096,14 +1343,44 @@ run_round() {
                 cd "$WORK_DIR"
 
                 "./$TOOL" "$INPUT_ABS" "$AMOUNT" > candidate.graph
-                ./bnb 4 candidate.graph > candidate.vec
+
+                local AFTER_EV GATE_RESULT GATE_STATUS
+                local AFTER_EV_DISTANCE WORKER_CURRENT_DISTANCE
+                local WORKER_DISTANCE_LIMIT GATE_REASON
+
+                "$EVS_ABS" candidate.graph > candidate.ev
+                AFTER_EV=$(read_single_eigenvalue candidate.ev "$LABEL after-change")
+                GATE_RESULT=$(evc_eigenvalue_gate \
+                    "$TARGET_EV" "$CURRENT_EV" "$AFTER_EV" "$evb")
+                IFS='|' read -r GATE_STATUS AFTER_EV_DISTANCE \
+                    WORKER_CURRENT_DISTANCE WORKER_DISTANCE_LIMIT GATE_REASON \
+                    <<< "$GATE_RESULT"
+
+                if [ "$GATE_STATUS" = "DISALLOWED" ]; then
+                    # A rejected EVC graph is not a failed worker. Publish the
+                    # rejection and skip the much more expensive bnb call.
+                    printf 'DISALLOWED|NA|NA|%s|%s|%s\n' \
+                        "$AFTER_EV" "$AFTER_EV_DISTANCE" "$GATE_REASON" \
+                        > "$EVC_DIR/$LABEL.result.tmp"
+                    mv "$EVC_DIR/$LABEL.result.tmp" "$EVC_DIR/$LABEL.result"
+                    exit 0
+                fi
+
+                if [ "$GATE_STATUS" != "ALLOWED" ]; then
+                    echo "Unexpected EVC eigenvalue-gate status '$GATE_STATUS' for $LABEL." >&2
+                    exit 1
+                fi
+
+                ./bnb "$GRAPHLET_K" candidate.graph > candidate.vec
                 displ "$VEC_INS" candidate.vec candidate.displ
 
                 local SCORE
                 SCORE=$(objective_score candidate.displ "$INPL")
 
                 mv candidate.graph "$EVC_DIR/$LABEL.graph"
-                printf '%s|%s\n' "$SCORE" "$EVC_DIR/$LABEL.graph" \
+                printf 'ALLOWED|%s|%s|%s|%s|%s\n' \
+                    "$SCORE" "$EVC_DIR/$LABEL.graph" "$AFTER_EV" \
+                    "$AFTER_EV_DISTANCE" "$GATE_REASON" \
                     > "$EVC_DIR/$LABEL.result.tmp"
                 mv "$EVC_DIR/$LABEL.result.tmp" "$EVC_DIR/$LABEL.result"
             ) &
@@ -1130,18 +1407,30 @@ run_round() {
 
         local BEST_EVC_GRAPH="$INPUT_ABS"
         local BEST_EVC_SCORE="$had_score"
-        local CUR_SCORE CUR_GRAPH
+        local EVC_STATUS CUR_SCORE CUR_GRAPH CUR_EV CUR_EV_DISTANCE CUR_REASON
 
         # Read in the original deterministic order so equal scores are handled
         # exactly as they were in the serial version.
         for LABEL in "${EVC_LABELS[@]}"; do
-            IFS='|' read -r CUR_SCORE CUR_GRAPH < "$EVC_DIR/$LABEL.result"
-            echo "$LABEL $ROUND_OBJECTIVE = $CUR_SCORE"
+            IFS='|' read -r EVC_STATUS CUR_SCORE CUR_GRAPH CUR_EV \
+                CUR_EV_DISTANCE CUR_REASON < "$EVC_DIR/$LABEL.result"
 
-            if float_less "$CUR_SCORE" "$BEST_EVC_SCORE"; then
-                BEST_EVC_SCORE="$CUR_SCORE"
-                BEST_EVC_GRAPH="$CUR_GRAPH"
-            fi
+            case "$EVC_STATUS" in
+                ALLOWED)
+                    echo "$LABEL eigenvalue allowed ($CUR_REASON): after_ev=$CUR_EV, log_distance=$CUR_EV_DISTANCE; $ROUND_OBJECTIVE=$CUR_SCORE"
+                    if float_less "$CUR_SCORE" "$BEST_EVC_SCORE"; then
+                        BEST_EVC_SCORE="$CUR_SCORE"
+                        BEST_EVC_GRAPH="$CUR_GRAPH"
+                    fi
+                    ;;
+                DISALLOWED)
+                    echo "$LABEL eigenvalue disallowed: after_ev=$CUR_EV, log_distance=$CUR_EV_DISTANCE; requires distance < $EVC_DISTANCE_LIMIT or distance < $CURRENT_EV_DISTANCE"
+                    ;;
+                *)
+                    echo "Invalid EVC result status '$EVC_STATUS' for $LABEL." >&2
+                    exit 1
+                    ;;
+            esac
         done
 
         if [ "$BEST_EVC_GRAPH" != "$INPUT_ABS" ]; then
@@ -1153,122 +1442,88 @@ run_round() {
         fi
 
         # Recompute the current graph vector after the possible EVC replacement.
-        "$BNB_ABS" 4 "$INPUT_ABS" > "$VEC_INS"
+        "$BNB_ABS" "$GRAPHLET_K" "$INPUT_ABS" > "$VEC_INS"
+        "$BNB_ABS" 4 "$INPUT_ABS" > "$ROOT_DIR/bres.tmp"
         cp "$ROOT_DIR/data_middle.txt" "$ROOT_DIR/data_middle1.txt"
         displ "$VEC_INS" "$VEC_TAR_ABS" "$INPL"
         cat "$VEC_INS" "$VEC_TAR_ABS" > "$INP"
 
         # ---------------------------------------------------------
-        # 2. Score all candidate pairs using a fixed worker pool.
+        # 2. Read all transformation probes once and score every active pair
+        #    in one bxk4f invocation. No shell worker or process per pair.
         # ---------------------------------------------------------
-        local PAIR_DIR="$ROUND_DIR/pairs"
         local RESULTS_FILE="$ROUND_DIR/round_results.tmp"
-        mkdir -p "$PAIR_DIR"
-        : > "$RESULTS_FILE"
-
+        local BATCH_INPUT="$ROUND_DIR/bxk4f_batch_input.tmp"
+        local -a BATCH_ENABLED=()
+        local BATCH_ID BATCH_PROBE BATCH_PROBE_WORDS
         local CAND_COUNT=${#ACTIVE_CANDS[@]}
-        local PAIR_WORKERS="$MAX_JOBS"
-        if (( PAIR_WORKERS > CAND_COUNT )); then
-            PAIR_WORKERS=$CAND_COUNT
+
+        for BATCH_ID in "${ACTIVE_CANDS[@]}"; do
+            BATCH_ENABLED[$BATCH_ID]=1
+        done
+
+        # Every ID 1..60 has metadata, including its edge change. Disabled
+        # entries (unused IDs 25/26 or rarity-filtered modes) have no curve.
+        # Current/target are raw frequencies; A/B are the measured log
+        # displacements already stored by generate_outinp.
+        {
+            printf 'BXK4F_BATCH_V1\n60\n'
+            cat "$INP"
+            printf '\n'
+            for ((BATCH_ID=1; BATCH_ID<=60; BATCH_ID++)); do
+                printf '%d %d %d\n' "$BATCH_ID" "${ec[$BATCH_ID]}" \
+                    "${BATCH_ENABLED[$BATCH_ID]:-0}"
+                if (( ${BATCH_ENABLED[$BATCH_ID]:-0} )); then
+                    BATCH_PROBE="$ROOT_DIR/outinp_val_${BATCH_ID}.txt"
+                    if [ ! -s "$BATCH_PROBE" ]; then
+                        echo "Missing transformation data: $BATCH_PROBE" >&2
+                        exit 1
+                    fi
+                    BATCH_PROBE_WORDS=$(wc -w < "$BATCH_PROBE")
+                    if (( BATCH_PROBE_WORDS != OUTINP_WORDS_EXPECTED )); then
+                        echo "Malformed $BATCH_PROBE: expected $OUTINP_WORDS_EXPECTED values for k=$GRAPHLET_K, got $BATCH_PROBE_WORDS." >&2
+                        exit 1
+                    fi
+                    cat "$BATCH_PROBE"
+                    printf '\n'
+                fi
+            done
+        } > "$BATCH_INPUT"
+
+        echo "Scoring $((CAND_COUNT * (CAND_COUNT + 1) / 2)) pairs from $CAND_COUNT active transformations in one bxk4f call."
+        if [ "$ROUND_OBJECTIVE" = "RSEAS" ]; then
+            "$BXK4F_ABS" "$GRAPHLET_K" "$RSEAS_E" "${RSEAS_WEIGHTS[@]}" \
+                < "$BATCH_INPUT" > "$RESULTS_FILE.pending"
+        else
+            "$BXK4F_ABS" "$GRAPHLET_K" \
+                < "$BATCH_INPUT" > "$RESULTS_FILE.pending"
         fi
-
-        local -a PAIR_PIDS=()
-        local PAIR_FAILED=0
-        local WORKER
-
-        for ((WORKER=0; WORKER<PAIR_WORKERS; WORKER++)); do
-            (
-                set -e
-                local WORK_DIR="$PAIR_DIR/work_$WORKER"
-                prepare_parallel_worker "$WORK_DIR" "$ROOT_DIR"
-                trap 'rm -rf -- "$WORK_DIR"' EXIT
-                cd "$WORK_DIR"
-
-                local LOCAL_RESULTS="pair_results.tmp"
-                : > "$LOCAL_RESULTS"
-
-                local VI VAL VAL2 MAG MAG2 EXPECTED
-                local OUT_INP OUT_INP2
-
-                # Round-robin assignment keeps the triangular pair workload
-                # reasonably balanced among the workers.
-                for ((VI=WORKER; VI<CAND_COUNT; VI+=PAIR_WORKERS)); do
-                    VAL="${ACTIVE_CANDS[$VI]}"
-
-                    for VAL2 in "${ACTIVE_CANDS[@]}"; do
-                        if (( VAL2 > VAL )); then
-                            continue
-                        fi
-
-                        OUT_INP="$ROOT_DIR/outinp_val_${VAL}.txt"
-                        OUT_INP2="$ROOT_DIR/outinp_val_${VAL2}.txt"
-
-                        if [ ! -s "$OUT_INP" ] || [ ! -s "$OUT_INP2" ]; then
-                            echo "Missing transformation data for pair $VAL,$VAL2." >&2
-                            exit 1
-                        fi
-
-                        # bxk4f input order is:
-                        #   current[6], target[6],
-                        #   first.ka first.kb first.A[6] first.B[6],
-                        #   second.ka second.kb second.A[6] second.B[6].
-                        # Each outinp file begins with its actual tested ka/kb.
-                        cat "$INP" "$OUT_INP" "$OUT_INP2" > pair_input.tmp
-
-                        local PAIR_INPUT_WORDS
-                        PAIR_INPUT_WORDS=$(wc -w < pair_input.tmp)
-                        if (( PAIR_INPUT_WORDS != 40 )); then
-                            echo "Malformed bxk4f input for pair $VAL,$VAL2: expected 40 values, got $PAIR_INPUT_WORDS." >&2
-                            exit 1
-                        fi
-
-                        if [ "$ROUND_OBJECTIVE" = "RSEAS" ]; then
-                            "$BXK4F_ABS" "${ec[$VAL]}" "${ec[$VAL2]}" "$RSEAS_E" \
-                                "${RSEAS_WEIGHTS[@]}" \
-                                < pair_input.tmp > pair_output.tmp
-                        else
-                            "$BXK4F_ABS" "${ec[$VAL]}" "${ec[$VAL2]}" \
-                                < pair_input.tmp > pair_output.tmp
-                        fi
-
-                        read -r MAG MAG2 EXPECTED < pair_output.tmp
-                        printf '%s|%s|%s|%s|%s\n' \
-                            "$EXPECTED" "$VAL" "$VAL2" "$MAG" "$MAG2" \
-                            >> "$LOCAL_RESULTS"
-                    done
-                done
-
-                mv "$LOCAL_RESULTS" "$PAIR_DIR/results_$WORKER.txt"
-            ) &
-            PAIR_PIDS+=("$!")
-        done
-
-        for PID in "${PAIR_PIDS[@]}"; do
-            if ! wait "$PID"; then
-                PAIR_FAILED=1
-            fi
-        done
-
-        if (( PAIR_FAILED )); then
-            echo "At least one parallel pair-scoring worker failed." >&2
-            exit 1
-        fi
-
-        for ((WORKER=0; WORKER<PAIR_WORKERS; WORKER++)); do
-            cat "$PAIR_DIR/results_$WORKER.txt" >> "$RESULTS_FILE"
-        done
+        mv "$RESULTS_FILE.pending" "$RESULTS_FILE"
 
         had_score=$(objective_score "$F0_ABS" "$INPL")
         echo "$ROUND_OBJECTIVE before modification is $had_score"
 
+        local BAD_ZERO_SCALE_COUNT
+        BAD_ZERO_SCALE_COUNT=$(awk -F'|' '
+            $1 == "BAD_ZERO_SCALE" { count++ }
+            END { print count + 0 }
+        ' "$RESULTS_FILE")
+        if (( BAD_ZERO_SCALE_COUNT > 0 )); then
+            echo "Excluded $BAD_ZERO_SCALE_COUNT mixed pairs because scale=0 implies a redundant candidate; self-pairs were retained."
+        fi
+
         # ---------------------------------------------------------
-        # 3. Evaluate the ten most promising pairs in parallel.
+        # 3. Evaluate the ten most promising nonredundant pairs in parallel.
         # ---------------------------------------------------------
         local TOP_DIR="$ROUND_DIR/top"
         mkdir -p "$TOP_DIR"
 
         local -a TOP_LINES=()
-        mapfile -t TOP_LINES < <(sort -n "$RESULTS_FILE" | head -n 10)
+        mapfile -t TOP_LINES < <(
+            awk -F'|' '$1 != "BAD_ZERO_SCALE"' "$RESULTS_FILE" |
+                sort -n |
+                head -n 10
+        )
 
         if (( ${#TOP_LINES[@]} == 0 )); then
             echo "No pair-scoring results were produced." >&2
@@ -1319,14 +1574,14 @@ run_round() {
                     "$sorted_VAL" "$sorted_VAL2" "$STAGE1" \
                     STAGE1_TESTED_SCALE STAGE1_TESTED_SCALE2
 
-                ./bnb 4 "$STAGE1" > stage1.vec
+                ./bnb "$GRAPHLET_K" "$STAGE1" > stage1.vec
                 displ "$VEC_INS" stage1.vec stage1.displ
                 cat "$INP" stage1.displ > scale_input.tmp
                 if [ "$ROUND_OBJECTIVE" = "RSEAS" ]; then
-                    "$BXK4ONE_ABS" "$RSEAS_E" "${RSEAS_WEIGHTS[@]}" \
+                    "$BXK4ONE_ABS" "$GRAPHLET_K" "$RSEAS_E" "${RSEAS_WEIGHTS[@]}" \
                         < scale_input.tmp > scale_output.tmp
                 else
-                    "$BXK4ONE_ABS" < scale_input.tmp > scale_output.tmp
+                    "$BXK4ONE_ABS" "$GRAPHLET_K" < scale_input.tmp > scale_output.tmp
                 fi
 
                 read -r MAG_FACTOR < scale_output.tmp
@@ -1343,7 +1598,7 @@ run_round() {
                     "$sorted_VAL" "$sorted_VAL2" "$FINAL_CANDIDATE" \
                     FINAL_TESTED_SCALE FINAL_TESTED_SCALE2
 
-                ./bnb 4 "$FINAL_CANDIDATE" > final.vec
+                ./bnb "$GRAPHLET_K" "$FINAL_CANDIDATE" > final.vec
                 displ "$VEC_INS" final.vec final.displ
                 GOT_SCORE=$(objective_score final.displ "$INPL")
 
@@ -1427,17 +1682,116 @@ run_round() {
         fi
 
         echo "Best pair was $BEST_VAL and $BEST_VAL2 with $ROUND_OBJECTIVE $BEST_SCORE and parameters $BEST_MAG,$BEST_MAG2"
+		echo "$BEST_VAL $BEST_VAL2" >> wcic.txt
 
         if float_greater "$BEST_SCORE" "$had_score"; then
             echo "The best evaluated pair was worse than the input ($ROUND_OBJECTIVE $had_score); keeping the input graph."
             cp "$INPUT_ABS" "$OUTPUT_ABS"
         else
-            echo "Using the saved best candidate directly; expfy will not be rerun."
-            cp "$BEST_GRAPH" "$OUTPUT_ABS"
+            echo "Using the saved best candidate, then refining the same pair $PAIR_REFINEMENT_PASSES times."
+
+            local REFINE_DIR="$ROUND_DIR/refinement"
+            mkdir -p "$REFINE_DIR"
+
+            local REFINE_GRAPH="$REFINE_DIR/current_best.graph"
+            local REFINE_SCORE="$BEST_SCORE"
+            local REFINE_SCALE="$BEST_MAG"
+            local REFINE_SCALE2="$BEST_MAG2"
+            cp "$BEST_GRAPH" "$REFINE_GRAPH"
+
+            local REFINE_ITER
+            local CURRENT_VEC PROBE_VEC CANDIDATE_VEC
+            local PROBE_DISPL CANDIDATE_TARGET_DISPL SCALE_INPUT
+            local PROBE_GRAPH REFINED_CANDIDATE
+            local PROBE_TESTED_SCALE PROBE_TESTED_SCALE2
+            local REQUESTED_NEW_SCALE REQUESTED_NEW_SCALE2
+            local CANDIDATE_TESTED_SCALE CANDIDATE_TESTED_SCALE2
+            local MAG_FACTOR CANDIDATE_SCORE SCALE_INPUT_WORDS
+
+            for ((REFINE_ITER=1; REFINE_ITER<=PAIR_REFINEMENT_PASSES; REFINE_ITER++)); do
+                CURRENT_VEC="$REFINE_DIR/current_${REFINE_ITER}.vec"
+                PROBE_VEC="$REFINE_DIR/probe_${REFINE_ITER}.vec"
+                CANDIDATE_VEC="$REFINE_DIR/candidate_${REFINE_ITER}.vec"
+                PROBE_DISPL="$REFINE_DIR/probe_${REFINE_ITER}.displ"
+                CANDIDATE_TARGET_DISPL="$REFINE_DIR/candidate_target_${REFINE_ITER}.displ"
+                SCALE_INPUT="$REFINE_DIR/scale_input_${REFINE_ITER}.tmp"
+                PROBE_GRAPH="$REFINE_DIR/probe_${REFINE_ITER}.graph"
+                REFINED_CANDIDATE="$REFINE_DIR/refined_candidate_${REFINE_ITER}.graph"
+
+                # The probe and final application must use node-selection data
+                # from the graph being refined. For k=5, this deliberately means
+                # one bnb 5 call for the objective vector and one bnb 4 call for
+                # data_middle1.txt.
+                "$BNB_ABS" "$GRAPHLET_K" "$REFINE_GRAPH" > "$CURRENT_VEC"
+                if (( GRAPHLET_K == 4 )); then
+                    cp "$ROOT_DIR/data_middle.txt" "$ROOT_DIR/data_middle1.txt"
+                else
+                    "$BNB_ABS" 4 "$REFINE_GRAPH" > "$REFINE_DIR/bres_${REFINE_ITER}.tmp"
+                    cp "$ROOT_DIR/data_middle.txt" "$ROOT_DIR/data_middle1.txt"
+                fi
+
+                # Probe by applying the same pair once more at its latest
+                # accepted effective scales.
+                apply_exp2 "$REFINE_GRAPH" "$REFINE_SCALE" "$REFINE_SCALE2" \
+                    "$BEST_VAL" "$BEST_VAL2" "$PROBE_GRAPH" \
+                    PROBE_TESTED_SCALE PROBE_TESTED_SCALE2
+
+                "$BNB_ABS" "$GRAPHLET_K" "$PROBE_GRAPH" > "$PROBE_VEC"
+                displ "$CURRENT_VEC" "$PROBE_VEC" "$PROBE_DISPL"
+                cat "$CURRENT_VEC" "$VEC_TAR_ABS" "$PROBE_DISPL" > "$SCALE_INPUT"
+
+                SCALE_INPUT_WORDS=$(wc -w < "$SCALE_INPUT")
+                if (( SCALE_INPUT_WORDS != SCALE_INPUT_WORDS_EXPECTED )); then
+                    echo "Malformed refinement bxk4one input: expected $SCALE_INPUT_WORDS_EXPECTED values for k=$GRAPHLET_K, got $SCALE_INPUT_WORDS." >&2
+                    exit 1
+                fi
+
+                if [ "$ROUND_OBJECTIVE" = "RSEAS" ]; then
+                    "$BXK4ONE_ABS" "$GRAPHLET_K" "$RSEAS_E" "${RSEAS_WEIGHTS[@]}" \
+                        < "$SCALE_INPUT" > "$REFINE_DIR/scale_output_${REFINE_ITER}.tmp"
+                else
+                    "$BXK4ONE_ABS" "$GRAPHLET_K" \
+                        < "$SCALE_INPUT" > "$REFINE_DIR/scale_output_${REFINE_ITER}.tmp"
+                fi
+                read -r MAG_FACTOR < "$REFINE_DIR/scale_output_${REFINE_ITER}.tmp"
+
+                # bxk4one returns one multiplier for the combined pair response,
+                # so x' and y' are the two actually completed probe scales times
+                # that common multiplier.
+                REQUESTED_NEW_SCALE=$(awk -v S="$PROBE_TESTED_SCALE" -v M="$MAG_FACTOR" \
+                    'BEGIN { print int(S * M) }')
+                REQUESTED_NEW_SCALE2=$(awk -v S="$PROBE_TESTED_SCALE2" -v M="$MAG_FACTOR" \
+                    'BEGIN { print int(S * M) }')
+
+                apply_exp2 "$REFINE_GRAPH" "$REQUESTED_NEW_SCALE" "$REQUESTED_NEW_SCALE2" \
+                    "$BEST_VAL" "$BEST_VAL2" "$REFINED_CANDIDATE" \
+                    CANDIDATE_TESTED_SCALE CANDIDATE_TESTED_SCALE2
+
+                "$BNB_ABS" "$GRAPHLET_K" "$REFINED_CANDIDATE" > "$CANDIDATE_VEC"
+                displ "$CANDIDATE_VEC" "$VEC_TAR_ABS" "$CANDIDATE_TARGET_DISPL"
+                CANDIDATE_SCORE=$(objective_score "$F0_ABS" "$CANDIDATE_TARGET_DISPL")
+
+                echo "Pair refinement $REFINE_ITER/$PAIR_REFINEMENT_PASSES for $BEST_VAL,$BEST_VAL2: probe scales=$PROBE_TESTED_SCALE,$PROBE_TESTED_SCALE2, multiplier=$MAG_FACTOR, candidate scales=$CANDIDATE_TESTED_SCALE,$CANDIDATE_TESTED_SCALE2, $ROUND_OBJECTIVE=$CANDIDATE_SCORE (current=$REFINE_SCORE)."
+
+                if float_less "$CANDIDATE_SCORE" "$REFINE_SCORE"; then
+                    mv "$REFINED_CANDIDATE" "$REFINE_GRAPH"
+                    REFINE_SCORE="$CANDIDATE_SCORE"
+                    REFINE_SCALE="$CANDIDATE_TESTED_SCALE"
+                    REFINE_SCALE2="$CANDIDATE_TESTED_SCALE2"
+                    echo "Pair refinement $REFINE_ITER accepted."
+                else
+                    rm -f "$REFINED_CANDIDATE"
+                    echo "Pair refinement $REFINE_ITER rejected; Skipping refinement."
+					break
+                fi
+            done
+
+            cp "$REFINE_GRAPH" "$OUTPUT_ABS"
+            echo "Final refined pair score: $ROUND_OBJECTIVE=$REFINE_SCORE with latest accepted scales $REFINE_SCALE,$REFINE_SCALE2."
         fi
 
         echo "Achieved graphlet frequency:"
-        "$BNB_ABS" 4 "$OUTPUT_ABS"
+        "$BNB_ABS" "$GRAPHLET_K" "$OUTPUT_ABS"
     )
 }
 
@@ -1510,13 +1864,13 @@ generate_outinp() {
                         SCALE=30000
                         apply_exp "$INS_ABS" "$SCALE" "$VAL" "$BASE_SYNTH1" \
                             TESTED_SCALE1
-                        ./bnb 4 "$BASE_SYNTH1" > "vecBS1_val_${VAL}.txt"
+                        ./bnb "$GRAPHLET_K" "$BASE_SYNTH1" > "vecBS1_val_${VAL}.txt"
                         displ "$VEC_INS_ABS" "vecBS1_val_${VAL}.txt" "trfBS1_val_${VAL}.txt"
 
                         SCALE=300000
                         apply_exp "$INS_ABS" "$SCALE" "$VAL" "$BASE_SYNTH2" \
                             TESTED_SCALE2
-                        ./bnb 4 "$BASE_SYNTH2" > "vecBS2_val_${VAL}.txt"
+                        ./bnb "$GRAPHLET_K" "$BASE_SYNTH2" > "vecBS2_val_${VAL}.txt"
                         displ "$VEC_INS_ABS" "vecBS2_val_${VAL}.txt" "trfBS2_val_${VAL}.txt"
 
                         # Each transformation file is self-contained:
@@ -1526,14 +1880,14 @@ generate_outinp() {
                         printf '%s %s\n' "$TESTED_SCALE1" "$TESTED_SCALE2" > "$OUT_INP"
                         cat "trfBS1_val_${VAL}.txt" "trfBS2_val_${VAL}.txt" >> "$OUT_INP"
 
-                        # bxk4f expects exactly 14 values per transformation:
-                        #   ka kb + six values at ka + six values at kb.
+                        # Each transformation probe contains:
+                        #   ka kb + D values at ka + D values at kb.
                         # Catch malformed probe data here instead of letting bxk4f
                         # fail later with only "incomplete input".
                         local OUT_INP_WORDS
                         OUT_INP_WORDS=$(wc -w < "$OUT_INP")
-                        if (( OUT_INP_WORDS != 14 )); then
-                                echo "Malformed $OUT_INP for transformation $VAL: expected 14 values (ka kb A[6] B[6]), got $OUT_INP_WORDS." >&2
+                        if (( OUT_INP_WORDS != OUTINP_WORDS_EXPECTED )); then
+                                echo "Malformed $OUT_INP for transformation $VAL: expected $OUTINP_WORDS_EXPECTED values for k=$GRAPHLET_K, got $OUT_INP_WORDS." >&2
                                 exit 1
                         fi
 
@@ -1569,15 +1923,16 @@ generate_outinp() {
 
 # Main loop
 CURRENT="$INIT_SYNTH"
-./bnb 4 "$TARGET" > vecTar.txt
+./bnb "$GRAPHLET_K" "$TARGET" > vecTar.txt
 
-# Phase 1: the requested number of dynamic-weight RSEAS rounds.
+# Phase 1: the requested number of dynamic-weight RSEAS rounds. Probe curves
+# are regenerated on rounds 1, 1+RBGO, 1+2*RBGO, ... within this phase.
 for ((i=1; i<=ROUNDS; i++)); do
     set_round_constraints "$i"
-    ./bnb 4 "$CURRENT" > vecInS.txt
+    ./bnb "$GRAPHLET_K" "$CURRENT" > vecInS.txt
     set_round_rseas_state "$i" vecInS.txt vecTar.txt
 
-    if (( (i-1) % 4 == 0 )); then
+    if (( (i-1) % RBGO == 0 )); then
         ./bnb 4 "$CURRENT" > bres.tmp
         cat data_middle.txt > data_middle1.txt
         refresh_rare_graphlets data_middle1.txt
@@ -1589,30 +1944,36 @@ for ((i=1; i<=ROUNDS; i++)); do
     CURRENT="$NEXT"
 done
 
-# Phase 2: regenerate transformation probes from the final RSEAS graph, then
-# perform exactly four equal-weight RMSE polishing rounds.  These rounds do not
-# change or consult the accumulated RSEAS weights/error range.
+# Phase 2: RMSE starts a new probe-refresh cadence. Thus its first round always
+# regenerates outinp, followed by every RBGO-th round within the RMSE phase.
 echo
-echo "Completed $ROUNDS RSEAS rounds. Starting $EXTRA_RMSE_ROUNDS equal-weight RMSE polishing rounds."
+if (( RMSE_ROUNDS > 0 )); then
+    echo "Completed $ROUNDS RSEAS rounds. Starting $RMSE_ROUNDS equal-weight RMSE polishing rounds."
+else
+    echo "Completed $ROUNDS RSEAS rounds. No RMSE polishing rounds were requested."
+fi
+
 evb="$TIGHTEST_EVB"
 degb="$TIGHTEST_DEGB"
 hdgb="$TIGHTEST_HDGB"
-./bnb 4 "$CURRENT" > vecInS.txt
-cat data_middle.txt > data_middle1.txt
-refresh_rare_graphlets data_middle1.txt
-generate_outinp "$CURRENT"
 
-for ((j=1; j<=EXTRA_RMSE_ROUNDS; j++)); do
+for ((j=1; j<=RMSE_ROUNDS; j++)); do
     set_rmse_round_constraints "$j"
+
+    if (( (j-1) % RBGO == 0 )); then
+        ./bnb "$GRAPHLET_K" "$CURRENT" > vecInS.txt
+        ./bnb 4 "$CURRENT" > bres.tmp
+        cat data_middle.txt > data_middle1.txt
+        refresh_rare_graphlets data_middle1.txt
+        generate_outinp "$CURRENT"
+    fi
+
     TOTAL_INDEX=$((ROUNDS + j))
     NEXT="tmp_round${TOTAL_INDEX}.txt"
     run_round "$CURRENT" "$NEXT" RMSE
     CURRENT="$NEXT"
 done
 
-cp "$CURRENT" "$FINAL"
-echo
-echo "Final output stored in $FINAL after $ROUNDS RSEAS rounds and $EXTRA_RMSE_ROUNDS RMSE rounds."
 rm -f baseline_val_*.txt outinp_val_*.txt synth1_*.txt \
       outinp_l_val_*.txt suminp_val_*.txt bext_val_*.txt \
           inp1l_*.txt synth_base_*.txt tmp_round*.txt PIS*.txt

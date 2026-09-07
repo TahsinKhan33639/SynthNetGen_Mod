@@ -1,21 +1,51 @@
+#include <algorithm>
+#include <array>
+#include <bit>
 #include <chrono>
-#include <bits/stdc++.h>
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <fstream>
+#include <initializer_list>
+#include <iostream>
+#include <limits>
+#include <numeric>
+#include <queue>
+#include <random>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
+
 using namespace std;
-using ld = double;
-const int MAX_ITERS = 10000;
-const ld EPS = 1e-12;
 
-// Bound work by attempted graphlet samples rather than elapsed wall time.
-// This makes each expfy process do a comparable amount of work even when
-// several processes are competing for CPU time in parallel.
-const long long MIN_SAMPLE_ATTEMPTS = 800000;
-const long long MAX_SAMPLE_ATTEMPTS = 1000000;
-const long long ATTEMPTS_PER_REQUESTED_CHANGE = 500;
+#ifndef EXPFY_MIN_SAMPLE_ATTEMPTS
+#define EXPFY_MIN_SAMPLE_ATTEMPTS 8000000LL
+#endif
+#ifndef EXPFY_MAX_SAMPLE_ATTEMPTS
+#define EXPFY_MAX_SAMPLE_ATTEMPTS 10000000LL
+#endif
+#ifndef EXPFY_ATTEMPTS_PER_REQUESTED_CHANGE
+#define EXPFY_ATTEMPTS_PER_REQUESTED_CHANGE 500LL
+#endif
+#ifndef EXPFY_MAX_NEIGHBOR_PICK_ATTEMPTS
+#define EXPFY_MAX_NEIGHBOR_PICK_ATTEMPTS 100
+#endif
 
-// A single graphlet-sampling attempt must also be bounded internally.
-// Otherwise pick_neighbor could keep retrying forever before the outer sample
-// counter gets a chance to advance.
-const int MAX_NEIGHBOR_PICK_ATTEMPTS = 100;
+namespace {
+
+constexpr long long MIN_SAMPLE_ATTEMPTS = EXPFY_MIN_SAMPLE_ATTEMPTS;
+constexpr long long MAX_SAMPLE_ATTEMPTS = EXPFY_MAX_SAMPLE_ATTEMPTS;
+constexpr long long ATTEMPTS_PER_REQUESTED_CHANGE =
+    EXPFY_ATTEMPTS_PER_REQUESTED_CHANGE;
+constexpr int MAX_NEIGHBOR_PICK_ATTEMPTS =
+    EXPFY_MAX_NEIGHBOR_PICK_ATTEMPTS;
+constexpr int ORCA4_COLUMNS = 15;
+constexpr int GOOD_NODE_COLUMN = 14;
+constexpr int MAX_OPS = 4;
+constexpr int MAX_TOUCHED_NODES = 2 * MAX_OPS;
+constexpr int MAX_RELATED_DEGREES = 2 * MAX_TOUCHED_NODES;
 
 struct SampleStats {
     int done1 = 0;
@@ -23,706 +53,1357 @@ struct SampleStats {
     long long attempts = 0;
 };
 
-unordered_map<int, int> adj6bit_to_id = {
-    {0b000000, 0},
-    {0b000001, 1},
-    {0b000010, 1},
-    {0b000011, 3},
-    {0b000100, 1},
-    {0b000101, 3},
-    {0b000110, 3},
-    {0b000111, 4},
-    {0b001000, 1},
-    {0b001001, 3},
-    {0b001010, 3},
-    {0b001011, 5},
-    {0b001100, 2},
-    {0b001101, 6},
-    {0b001110, 6},
-    {0b001111, 7},
-    {0b010000, 1},
-    {0b010001, 3},
-    {0b010010, 2},
-    {0b010011, 6},
-    {0b010100, 3},
-    {0b010101, 5},
-    {0b010110, 6},
-    {0b010111, 7},
-    {0b011000, 3},
-    {0b011001, 4},
-    {0b011010, 6},
-    {0b011011, 7},
-    {0b011100, 6},
-    {0b011101, 7},
-    {0b011110, 8},
-    {0b011111, 9},
-    {0b100000, 1},
-    {0b100001, 2},
-    {0b100010, 3},
-    {0b100011, 6},
-    {0b100100, 3},
-    {0b100101, 6},
-    {0b100110, 5},
-    {0b100111, 7},
-    {0b101000, 3},
-    {0b101001, 6},
-    {0b101010, 4},
-    {0b101011, 7},
-    {0b101100, 6},
-    {0b101101, 8},
-    {0b101110, 7},
-    {0b101111, 9},
-    {0b110000, 3},
-    {0b110001, 6},
-    {0b110010, 6},
-    {0b110011, 8},
-    {0b110100, 4},
-    {0b110101, 7},
-    {0b110110, 7},
-    {0b110111, 9},
-    {0b111000, 5},
-    {0b111001, 7},
-    {0b111010, 7},
-    {0b111011, 9},
-    {0b111100, 7},
-    {0b111101, 9},
-    {0b111110, 9},
-    {0b111111, 10},
+// xoshiro256**. It is substantially cheaper than repeatedly constructing and
+// invoking standard-library distribution objects inside the sampling loop.
+class FastRng {
+public:
+    explicit FastRng(uint64_t seed) {
+        for (uint64_t& value : state_) {
+            value = splitmix64(seed);
+        }
+        if ((state_[0] | state_[1] | state_[2] | state_[3]) == 0) {
+            state_[0] = 1;
+        }
+    }
+
+    uint64_t next_u64() {
+        const uint64_t result = rotl(state_[1] * 5, 7) * 9;
+        const uint64_t t = state_[1] << 17;
+
+        state_[2] ^= state_[0];
+        state_[3] ^= state_[1];
+        state_[1] ^= state_[2];
+        state_[0] ^= state_[3];
+        state_[2] ^= t;
+        state_[3] = rotl(state_[3], 45);
+        return result;
+    }
+
+    uint64_t bounded(uint64_t bound) {
+        if (bound <= 1) return 0;
+
+#if defined(__SIZEOF_INT128__)
+        // Lemire's unbiased multiply-high reduction.
+        uint64_t x = next_u64();
+        __uint128_t product = static_cast<__uint128_t>(x) * bound;
+        uint64_t low = static_cast<uint64_t>(product);
+        if (low < bound) {
+            const uint64_t threshold = static_cast<uint64_t>(-bound) % bound;
+            while (low < threshold) {
+                x = next_u64();
+                product = static_cast<__uint128_t>(x) * bound;
+                low = static_cast<uint64_t>(product);
+            }
+        }
+        return static_cast<uint64_t>(product >> 64);
+#else
+        const uint64_t threshold = static_cast<uint64_t>(-bound) % bound;
+        uint64_t value;
+        do {
+            value = next_u64();
+        } while (value < threshold);
+        return value % bound;
+#endif
+    }
+
+    bool chance(unsigned numerator, unsigned denominator) {
+        return bounded(denominator) < numerator;
+    }
+
+private:
+    array<uint64_t, 4> state_{};
+
+    static uint64_t rotl(uint64_t x, int k) {
+        return (x << k) | (x >> (64 - k));
+    }
+
+    static uint64_t splitmix64(uint64_t& x) {
+        uint64_t z = (x += 0x9e3779b97f4a7c15ULL);
+        z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+        z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+        return z ^ (z >> 31);
+    }
 };
 
-int get_graph_id(const vector<vector<int>>& adj) {
-    int bits = 0;
-    bits |= adj[2][3] ? (1 << 0) : 0;
-    bits |= adj[1][3] ? (1 << 1) : 0;
-    bits |= adj[1][2] ? (1 << 2) : 0;
-    bits |= adj[0][3] ? (1 << 3) : 0;
-    bits |= adj[0][2] ? (1 << 4) : 0;
-    bits |= adj[0][1] ? (1 << 5) : 0;
-    if (adj6bit_to_id.count(bits))
-        return adj6bit_to_id[bits];
-    else
-        return -1;
+uint64_t make_seed() {
+    if (const char* text = getenv("EXPFY_SEED")) {
+        try {
+            size_t used = 0;
+            const string value(text);
+            const uint64_t seed = stoull(value, &used, 0);
+            if (used == value.size()) return seed;
+        } catch (const exception&) {
+            // Fall through to a nondeterministic seed.
+        }
+        cerr << "Warning: ignoring invalid EXPFY_SEED='" << text << "'.\n";
+    }
+
+    random_device rd;
+    uint64_t seed =
+        static_cast<uint64_t>(chrono::high_resolution_clock::now()
+                                  .time_since_epoch()
+                                  .count());
+    seed ^= static_cast<uint64_t>(rd()) << 32;
+    seed ^= static_cast<uint64_t>(rd());
+    return seed;
 }
 
-SampleStats sample_edge_prob(vector<vector<int>>& adj, vector<vector<char>>& bvv, int num_samples, int num_samples2, int m1, int m2,
-					 vector<ld> x, ld evl, ld evbound, vector<int> degb, double degbound, vector<int> gdnd, int hdgbound) {
-	vector<double> cntr(6, 0);
-    int n = adj.size();
-	vector<bool> gnif(n, false);
-	for (auto i : gdnd) gnif[i] = true;
-    if (n < 4) {
-        cerr << "Graph must have at least 4 nodes.\n";
-        return {};
+// One packed bit row per vertex. This uses about n^2/8 bytes rather than the
+// old vector<vector<char>> matrix's n^2 bytes plus n row allocations.
+class BitAdjacency {
+public:
+    BitAdjacency() = default;
+    explicit BitAdjacency(int n) { reset(n); }
+
+    void reset(int n) {
+        n_ = n;
+        words_per_row_ = (static_cast<size_t>(n) + 63) / 64;
+        bits_.assign(static_cast<size_t>(n) * words_per_row_, 0);
     }
-    random_device rd;
-    mt19937 rng(rd());
 
-	vector<ld> y(n, 0), z(n, 0);
-	for(int i = 0; i<n; i++){
-		for(auto j : adj[i]){
-			y[i] += x[j];
-		}
-		y[i] = 1/evl*y[i];
-	}
-	int edgec = 0, edgeb = 0;
-	for(auto de : degb) edgeb += de;
-	edgec = edgeb;
-	vector<int> deg(n, 0), degz(n, 0);
-	for(int i = 0; i<n; i++){
-		deg[i] = adj[i].size();
-	}
+    [[nodiscard]] bool get(int u, int v) const {
+        const size_t index =
+            static_cast<size_t>(u) * words_per_row_ +
+            static_cast<size_t>(v >> 6);
+        return (bits_[index] >> (v & 63)) & 1ULL;
+    }
 
-	vector<int> hdg(n, 0), hdgz(n, 0), hdgb(n, 0);
-	for(int i=0; i<n; i++){
-		hdg[deg[i]]++;
-		hdgb[degb[i]]++;
-	}
+    void set(int u, int v, bool present) {
+        const size_t index =
+            static_cast<size_t>(u) * words_per_row_ +
+            static_cast<size_t>(v >> 6);
+        const uint64_t mask = 1ULL << (v & 63);
+        if (present) {
+            bits_[index] |= mask;
+        } else {
+            bits_[index] &= ~mask;
+        }
+    }
 
-	auto j = [&](int u, int v) {
-	    adj[v].push_back(u);
-	    adj[u].push_back(v);
-	    bvv[v][u] = bvv[u][v] = 1;
-		y[u] = y[u] + 1/evl*x[v];
-		y[v] = y[v] + 1/evl*x[u];
-		hdg[deg[u]]--; hdg[deg[v]]--;
-		deg[u]++; deg[v]++;
-		hdg[deg[u]]++; hdg[deg[v]]++;
-		edgec++;
-	};
+    void set_undirected(int u, int v, bool present) {
+        set(u, v, present);
+        set(v, u, present);
+    }
 
-	auto d = [&](int u, int v) {
-	    adj[v].erase(remove(adj[v].begin(), adj[v].end(), u), adj[v].end());
-	    adj[u].erase(remove(adj[u].begin(), adj[u].end(), v), adj[u].end());
-	    bvv[v][u] = bvv[u][v] = 0;
-		y[u] = y[u] - 1/evl*x[v];
-		y[v] = y[v] - 1/evl*x[u];
-		hdg[deg[u]]--; hdg[deg[v]]--;
-		deg[u]--; deg[v]--;
-		hdg[deg[u]]++; hdg[deg[v]]++;
-		edgec--;
-	};
+private:
+    int n_ = 0;
+    size_t words_per_row_ = 0;
+    vector<uint64_t> bits_;
+};
 
-	int donereps = 0;
-	int donereps2 = 0;
-	int active_slot = 1;
-	int m = m1;
+struct EdgeListData {
+    int n = 0;
+    vector<pair<int, int>> edges;
+    vector<int> degree;
+};
 
-	int lklk1=0, lklk2=0, lklk3=0, lklk4=0;
+EdgeListData read_edge_list(const string& filename) {
+    ifstream input(filename);
+    if (!input) {
+        throw runtime_error("cannot open graph file '" + filename + "'");
+    }
 
-    auto op = [&](const vector<tuple<int,int,int>>& ops) {
-        if (ops.empty()) return;
+    vector<pair<int, int>> edges;
+    string line;
+    int maximum_vertex = -1;
 
-        auto valid = [&](int node, ld new_val) {
-            ld old_val = y[node];
-            if (new_val <= 0 || old_val <= 0 || x[node] <= 0)
-                return false;
+    while (getline(input, line)) {
+        istringstream parser(line);
+        int u = -1;
+        int v = -1;
+        if (!(parser >> u >> v)) continue;
+        if (u < 0 || v < 0) {
+            throw runtime_error("negative vertex ID in '" + filename + "'");
+        }
+        if (u == v) continue;
+        if (u > v) swap(u, v);
+        edges.emplace_back(u, v);
+        maximum_vertex = max(maximum_vertex, v);
+    }
 
-            ld target = log(x[node]);
+    if (maximum_vertex < 0) {
+        throw runtime_error("graph file '" + filename + "' has no edges");
+    }
 
-            ld new_dist = abs(log(new_val) - target);
-            if (new_dist <= evbound)
-                return true;
+    sort(edges.begin(), edges.end());
+    edges.erase(unique(edges.begin(), edges.end()), edges.end());
 
-            ld old_dist = abs(log(old_val) - target);
-            if (new_dist < old_dist)
-                return true;
-            lklk1++;
-            return false;
-        };
+    EdgeListData result;
+    result.n = maximum_vertex + 1;
+    result.edges = move(edges);
+    result.degree.assign(result.n, 0);
+    for (const auto& [u, v] : result.edges) {
+        result.degree[u]++;
+        result.degree[v]++;
+    }
+    return result;
+}
 
-        auto valideg = [&](int node, int new_val) {
-            int old_val = deg[node];
-            if (new_val <= 0 || old_val <= 0 || x[node] <= 0)
-                return false;
+struct Graph {
+    int n = 0;
+    long long edge_count = 0;
+    vector<vector<int>> adj;
+    vector<int> degree;
+    BitAdjacency matrix;
 
-            int target = degb[node];
+    explicit Graph(const EdgeListData& data)
+        : n(data.n),
+          edge_count(static_cast<long long>(data.edges.size())),
+          adj(data.n),
+          degree(data.degree),
+          matrix(data.n) {
+        for (int u = 0; u < n; ++u) {
+            adj[u].reserve(static_cast<size_t>(degree[u]) + 4);
+        }
+        for (const auto& [u, v] : data.edges) {
+            adj[u].push_back(v);
+            adj[v].push_back(u);
+            matrix.set_undirected(u, v, true);
+        }
+    }
 
-            int new_dist = abs(new_val - target);
-            double new_distl = abs(log(new_val) - log(target));
-            if (new_distl <= degbound)
-                return true;
+    static bool erase_neighbor_swap(vector<int>& neighbors, int value) {
+        const auto it = find(neighbors.begin(), neighbors.end(), value);
+        if (it == neighbors.end()) return false;
+        *it = neighbors.back();
+        neighbors.pop_back();
+        return true;
+    }
 
-			if (new_dist <= max(degbound*n*3/100, (double)5))
-				return true;
+    void add_edge_unchecked(int u, int v) {
+        adj[u].push_back(v);
+        adj[v].push_back(u);
+        matrix.set_undirected(u, v, true);
+        degree[u]++;
+        degree[v]++;
+        edge_count++;
+    }
 
-            int old_dist = abs(old_val - target);
-            if (new_dist < old_dist)
-                return true;
-            lklk2++;
-            return false;
-        };
+    void remove_edge_unchecked(int u, int v) {
+        const bool removed_u = erase_neighbor_swap(adj[u], v);
+        const bool removed_v = erase_neighbor_swap(adj[v], u);
+        if (!removed_u || !removed_v) {
+            throw runtime_error("adjacency list/matrix inconsistency while deleting edge");
+        }
+        matrix.set_undirected(u, v, false);
+        degree[u]--;
+        degree[v]--;
+        edge_count--;
+    }
+};
 
-        auto validhdg = [&](int dgX, int new_val) {
-            if (dgX < 0 || dgX >= n)
-                return false;
+constexpr array<uint8_t, 64> GRAPH_ID_BY_BITS = {
+    0, 1, 1, 3, 1, 3, 3, 4,
+    1, 3, 3, 5, 2, 6, 6, 7,
+    1, 3, 2, 6, 3, 5, 6, 7,
+    3, 4, 6, 7, 6, 7, 8, 9,
+    1, 2, 3, 6, 3, 6, 5, 7,
+    3, 6, 4, 7, 6, 8, 7, 9,
+    3, 6, 6, 8, 4, 7, 7, 9,
+    5, 7, 7, 9, 7, 9, 9, 10,
+};
 
-            int old_val = hdg[dgX];
-            // Zero nodes in a degree bin is valid. Only negative counts are invalid.
-            if (new_val < 0 || old_val < 0)
-                return false;
+constexpr array<int8_t, 61> make_required_gid_table() {
+    array<int8_t, 61> table{};
+    for (int i = 0; i <= 60; ++i) table[i] = -1;
 
-            int target = hdgb[dgX];
+    for (int i = 1; i <= 9; ++i) table[i] = 6;
+    table[29] = table[34] = table[35] = table[37] = table[38] = table[52] = 6;
 
-            int new_dist = abs(new_val - target);
-            if (new_dist <= hdgbound)
-                return true;
+    for (int i = 10; i <= 17; ++i) table[i] = 7;
+    table[28] = table[33] = table[41] = table[42] = table[51] = table[56] = 7;
 
-            int old_dist = abs(old_val - target);
-            if (new_dist < old_dist)
-                return true;
+    table[18] = table[19] = table[20] = 5;
+    table[30] = table[36] = table[39] = table[53] = table[54] = 5;
 
-            lklk3++;
-            return false;
-        };
+    table[21] = table[22] = table[23] = 8;
+    table[27] = table[32] = table[40] = table[50] = table[57] = table[58] = 8;
 
-        set<int> nodesinop;
-        set<pair<int,int>> touched_edges;
+    table[24] = table[31] = table[48] = table[49] = table[55] = 9;
 
-        // Validate the complete operation list against the current simple graph
-        // before changing temporary degrees or indexing histogram arrays.
-        for (auto [type, n1, n2] : ops) {
-            if (type != 1 && type != 2)
-                return;
-            if (n1 < 0 || n1 >= n || n2 < 0 || n2 >= n || n1 == n2)
-                return;
+    for (int i = 43; i <= 47; ++i) table[i] = 10;
+    table[59] = 10;
 
-            int a = min(n1, n2);
-            int b = max(n1, n2);
-            if (!touched_edges.insert({a, b}).second)
-                return;
+    // 25 and 26 are unused. Mode 60 has its own five-node test.
+    return table;
+}
 
-            bool edge_exists = bvv[n1][n2] != 0;
-            if ((type == 1 && edge_exists) ||
-                (type == 2 && !edge_exists)) {
-                return;
+constexpr auto REQUIRED_GID = make_required_gid_table();
+
+using Sub4 = array<array<uint8_t, 4>, 4>;
+
+int graph_id_from_sub4(const Sub4& sub) {
+    unsigned bits = 0;
+    bits |= static_cast<unsigned>(sub[2][3]) << 0;
+    bits |= static_cast<unsigned>(sub[1][3]) << 1;
+    bits |= static_cast<unsigned>(sub[1][2]) << 2;
+    bits |= static_cast<unsigned>(sub[0][3]) << 3;
+    bits |= static_cast<unsigned>(sub[0][2]) << 4;
+    bits |= static_cast<unsigned>(sub[0][1]) << 5;
+    return GRAPH_ID_BY_BITS[bits];
+}
+
+vector<int> match_target_degrees_by_current_rank(
+    vector<int> target_degrees,
+    const vector<int>& current_degrees) {
+    if (target_degrees.size() != current_degrees.size()) {
+        throw runtime_error("target and synthetic graphs have different node counts");
+    }
+
+    sort(target_degrees.begin(), target_degrees.end());
+    vector<int> indices(current_degrees.size());
+    iota(indices.begin(), indices.end(), 0);
+    sort(indices.begin(), indices.end(), [&](int lhs, int rhs) {
+        return current_degrees[lhs] < current_degrees[rhs];
+    });
+
+    vector<int> matched(current_degrees.size());
+    for (size_t rank = 0; rank < indices.size(); ++rank) {
+        matched[indices[rank]] = target_degrees[rank];
+    }
+    return matched;
+}
+
+vector<uint8_t> read_good_node_mask(int n) {
+    ifstream input("data_middle1.txt");
+    if (!input) {
+        throw runtime_error("cannot open data_middle1.txt");
+    }
+
+    vector<uint8_t> mask(n, 0);
+    for (int row = 0; row < n; ++row) {
+        for (int column = 0; column < ORCA4_COLUMNS; ++column) {
+            long long value = 0;
+            if (!(input >> value)) {
+                throw runtime_error(
+                    "data_middle1.txt ended before " + to_string(n) +
+                    " complete 15-column rows were read");
             }
+            if (column == GOOD_NODE_COLUMN && value > 0) mask[row] = 1;
+        }
+    }
 
-            nodesinop.insert(n1);
-            nodesinop.insert(n2);
+    long long extra = 0;
+    if (input >> extra) {
+        throw runtime_error(
+            "data_middle1.txt contains more rows than the synthetic graph");
+    }
+    return mask;
+}
+
+enum class EdgeAction : uint8_t { Add = 1, Remove = 2 };
+
+struct EdgeOp {
+    EdgeAction action;
+    int u;
+    int v;
+};
+
+class Sampler {
+public:
+    Sampler(Graph& graph,
+            vector<int> target_degree,
+            double degree_log_bound,
+            int histogram_bound,
+            vector<uint8_t> good_mask,
+            uint64_t seed)
+        : graph_(graph),
+          target_degree_(move(target_degree)),
+          degree_log_bound_(degree_log_bound),
+          histogram_bound_(histogram_bound),
+          good_mask_(move(good_mask)),
+          rng_(seed),
+          current_histogram_(graph.n, 0),
+          target_histogram_(graph.n, 0),
+          target_log_degree_(graph.n, 0.0),
+          log_degree_(graph.n, -numeric_limits<double>::infinity()) {
+        if (graph_.n < 4) {
+            throw runtime_error("graph must have at least 4 nodes");
+        }
+        if (target_degree_.size() != static_cast<size_t>(graph_.n) ||
+            good_mask_.size() != static_cast<size_t>(graph_.n)) {
+            throw runtime_error("internal sampler vector-size mismatch");
+        }
+        if (!isfinite(degree_log_bound_) || degree_log_bound_ < 0.0) {
+            throw runtime_error("degbound must encode a finite nonnegative log bound");
+        }
+        if (histogram_bound_ < 0) {
+            throw runtime_error("hdgbound must be nonnegative");
         }
 
-        for (int node : nodesinop) {
-            z[node] = y[node];
-            degz[node] = deg[node];
+        for (int degree = 1; degree < graph_.n; ++degree) {
+            log_degree_[degree] = log(static_cast<double>(degree));
         }
 
-        for (auto [type, n1, n2] : ops) {
-            if (type == 1) {
-                z[n1] += 1 / evl * x[n2];
-                z[n2] += 1 / evl * x[n1];
-                degz[n1]++;
-                degz[n2]++;
+        for (int node = 0; node < graph_.n; ++node) {
+            const int current = graph_.degree[node];
+            const int target = target_degree_[node];
+            if (current < 0 || current >= graph_.n ||
+                target <= 0 || target >= graph_.n) {
+                throw runtime_error(
+                    "target/current degrees must lie in [1,n-1]");
+            }
+            current_histogram_[current]++;
+            target_histogram_[target]++;
+            target_log_degree_[node] = log_degree_[target];
+
+            if (good_mask_[node]) {
+                good_nodes_.push_back(node);
             } else {
-                z[n1] -= 1 / evl * x[n2];
-                z[n2] -= 1 / evl * x[n1];
-                degz[n1]--;
-                degz[n2]--;
+                ordinary_nodes_.push_back(node);
             }
         }
 
-        // A simple n-node graph has degrees in [0, n-1]. Reject an operation
-        // before any degree is used as a histogram index if it violates that.
-        for (int node : nodesinop) {
-            if (deg[node] < 0 || deg[node] >= n ||
-                degz[node] < 0 || degz[node] >= n) {
-                return;
+        // Preserve the old fallback:
+        // abs(new_degree-target_degree) <= max(degbound*n*3/100, 5).
+        degree_absolute_fallback_ =
+            max(degree_log_bound_ * graph_.n * 3.0 / 100.0, 5.0);
+    }
+
+    SampleStats run(int requested1, int requested2, int mode1, int mode2) {
+        requested1 = max(0, requested1);
+        requested2 = max(0, requested2);
+        validate_mode(mode1);
+        validate_mode(mode2);
+
+        requested1_ = requested1;
+        requested2_ = requested2;
+        mode1_ = mode1;
+        mode2_ = mode2;
+
+        const long long requested_total =
+            static_cast<long long>(requested1_) + requested2_;
+        long long attempt_limit = 0;
+        if (requested_total > 0) {
+            const long long scaled =
+                requested_total >
+                        MAX_SAMPLE_ATTEMPTS /
+                            ATTEMPTS_PER_REQUESTED_CHANGE
+                    ? MAX_SAMPLE_ATTEMPTS
+                    : requested_total * ATTEMPTS_PER_REQUESTED_CHANGE;
+            attempt_limit = clamp(
+                scaled, MIN_SAMPLE_ATTEMPTS, MAX_SAMPLE_ATTEMPTS);
+        }
+
+        long long attempts = 0;
+        for (; attempts < attempt_limit &&
+               (done1_ < requested1_ || done2_ < requested2_);
+             ++attempts) {
+            choose_active_slot();
+            const int mode = active_slot_ == 1 ? mode1_ : mode2_;
+            sample_one(mode);
+        }
+
+        if (done1_ < requested1_ || done2_ < requested2_) {
+            cerr << "Warning: sample-attempt limit reached after " << attempts
+                 << " attempts before all requested changes were completed.\n";
+        }
+
+        return {done1_, done2_, attempts};
+    }
+
+private:
+    Graph& graph_;
+    vector<int> target_degree_;
+    double degree_log_bound_ = 0.0;
+    double degree_absolute_fallback_ = 5.0;
+    int histogram_bound_ = 0;
+    vector<uint8_t> good_mask_;
+    vector<int> good_nodes_;
+    vector<int> ordinary_nodes_;
+    FastRng rng_;
+    vector<int> current_histogram_;
+    vector<int> target_histogram_;
+    vector<double> target_log_degree_;
+    vector<double> log_degree_;
+
+    int requested1_ = 0;
+    int requested2_ = 0;
+    int done1_ = 0;
+    int done2_ = 0;
+    int mode1_ = 1;
+    int mode2_ = 1;
+    int active_slot_ = 1;
+
+    static void validate_mode(int mode) {
+        if (mode < 1 || mode > 60 || mode == 25 || mode == 26) {
+            throw runtime_error("transformation mode must be 1..60 except 25 and 26");
+        }
+    }
+
+    void choose_active_slot() {
+        const bool need1 = done1_ < requested1_;
+        const bool need2 = done2_ < requested2_;
+
+        if (!need1) {
+            active_slot_ = 2;
+        } else if (!need2) {
+            active_slot_ = 1;
+        } else {
+            const double progress1 =
+                static_cast<double>(done1_) / requested1_;
+            const double progress2 =
+                static_cast<double>(done2_) / requested2_;
+            if (progress1 > progress2 + 0.02) active_slot_ = 2;
+            if (progress1 < progress2 - 0.02) active_slot_ = 1;
+        }
+    }
+
+    int pick_first_node() {
+        // The old rejection loop gave each good node weight 1 and each other
+        // node weight 0.2. Multiplying by five yields the exact integer weights
+        // 5:1, avoiding a geometric retry loop without changing the distribution.
+        const uint64_t good_weight =
+            static_cast<uint64_t>(good_nodes_.size()) * 5ULL;
+        const uint64_t total_weight =
+            good_weight + static_cast<uint64_t>(ordinary_nodes_.size());
+        if (total_weight == 0) return -1;
+
+        const uint64_t choice = rng_.bounded(total_weight);
+        if (choice < good_weight) {
+            return good_nodes_[choice / 5ULL];
+        }
+        return ordinary_nodes_[choice - good_weight];
+    }
+
+    static bool contains_node(
+        const array<int, 5>& nodes, int count, int value) {
+        for (int i = 0; i < count; ++i) {
+            if (nodes[i] == value) return true;
+        }
+        return false;
+    }
+
+    int pick_neighbor(const array<int, 5>& nodes, int count) {
+        for (int attempt = 0;
+             attempt < MAX_NEIGHBOR_PICK_ATTEMPTS;
+             ++attempt) {
+            const int u = nodes[rng_.bounded(static_cast<uint64_t>(count))];
+            if (graph_.adj[u].empty()) continue;
+
+            const int v = graph_.adj[u][rng_.bounded(graph_.adj[u].size())];
+            if (contains_node(nodes, count, v)) continue;
+
+            // Preserve the old 70% rejection bias for non-good nodes.
+            if (!good_mask_[v] && rng_.chance(7, 10)) continue;
+            return v;
+        }
+        return -1;
+    }
+
+    void shuffle_first_four(array<int, 5>& nodes) {
+        for (int i = 3; i > 0; --i) {
+            const int j = static_cast<int>(
+                rng_.bounded(static_cast<uint64_t>(i + 1)));
+            swap(nodes[i], nodes[j]);
+        }
+    }
+
+    int random_neighbor(int node) {
+        if (graph_.adj[node].empty()) return -1;
+        return graph_.adj[node][rng_.bounded(graph_.adj[node].size())];
+    }
+
+    Sub4 build_sub4(const array<int, 5>& nodes) const {
+        Sub4 sub{};
+        for (int a = 0; a < 4; ++a) {
+            for (int b = 0; b < a; ++b) {
+                const uint8_t edge =
+                    graph_.matrix.get(nodes[a], nodes[b]) ? 1 : 0;
+                sub[a][b] = edge;
+                sub[b][a] = edge;
             }
         }
+        return sub;
+    }
 
-        bool open = true;
-        for (int node : nodesinop) {
-            open &= valid(node, z[node]);
-            open &= valideg(node, degz[node]);
+    static int sub_degree(const Sub4& sub, int node) {
+        return sub[node][0] + sub[node][1] +
+               sub[node][2] + sub[node][3];
+    }
+
+    bool degree_allowed(int node, int old_degree, int new_degree) const {
+        if (new_degree <= 0 || new_degree >= graph_.n ||
+            old_degree <= 0 || old_degree >= graph_.n) {
+            return false;
         }
 
-        set<int> related_deg;
-        for (int node : nodesinop) {
-            related_deg.insert(deg[node]);
-            related_deg.insert(degz[node]);
+        const int target = target_degree_[node];
+        const double new_log_distance =
+            abs(log_degree_[new_degree] - target_log_degree_[node]);
+        if (new_log_distance <= degree_log_bound_) return true;
+
+        const int new_distance = abs(new_degree - target);
+        if (new_distance <= degree_absolute_fallback_) return true;
+
+        const int old_distance = abs(old_degree - target);
+        return new_distance < old_distance;
+    }
+
+    bool histogram_allowed(int degree, int new_count) const {
+        if (degree < 0 || degree >= graph_.n || new_count < 0) {
+            return false;
         }
 
-        for (int degree : related_deg) {
-            hdgz[degree] = hdg[degree];
+        const int old_count = current_histogram_[degree];
+        const int target_count = target_histogram_[degree];
+        const int new_distance = abs(new_count - target_count);
+        if (new_distance <= histogram_bound_) return true;
+
+        const int old_distance = abs(old_count - target_count);
+        return new_distance < old_distance;
+    }
+
+    bool try_operation(initializer_list<EdgeOp> operations) {
+        if (operations.size() == 0 || operations.size() > MAX_OPS) {
+            return false;
         }
-        for (int node : nodesinop) {
-            hdgz[deg[node]]--;
-            hdgz[degz[node]]++;
+
+        array<pair<int, int>, MAX_OPS> touched_edges{};
+        int edge_count = 0;
+        array<int, MAX_TOUCHED_NODES> nodes{};
+        int node_count = 0;
+
+        auto add_unique_node = [&](int node) {
+            for (int i = 0; i < node_count; ++i) {
+                if (nodes[i] == node) return;
+            }
+            nodes[node_count++] = node;
+        };
+
+        for (const EdgeOp& operation : operations) {
+            const int u = operation.u;
+            const int v = operation.v;
+            if (u < 0 || u >= graph_.n ||
+                v < 0 || v >= graph_.n || u == v) {
+                return false;
+            }
+
+            const pair<int, int> edge = minmax(u, v);
+            for (int i = 0; i < edge_count; ++i) {
+                if (touched_edges[i] == edge) return false;
+            }
+            touched_edges[edge_count++] = edge;
+
+            const bool exists = graph_.matrix.get(u, v);
+            if ((operation.action == EdgeAction::Add && exists) ||
+                (operation.action == EdgeAction::Remove && !exists)) {
+                return false;
+            }
+
+            add_unique_node(u);
+            add_unique_node(v);
         }
-        for (int degree : related_deg) {
-            open &= validhdg(degree, hdgz[degree]);
+
+        array<int, MAX_TOUCHED_NODES> old_degree{};
+        array<int, MAX_TOUCHED_NODES> new_degree{};
+        for (int i = 0; i < node_count; ++i) {
+            old_degree[i] = graph_.degree[nodes[i]];
+            new_degree[i] = old_degree[i];
         }
 
-        if (!open) return;
-        lklk4++;
-        if (active_slot == 1 && donereps < num_samples) donereps++;
-        if (active_slot == 2 && donereps2 < num_samples2) donereps2++;
-        for (auto [type, n1, n2] : ops) {
-            if (type == 1) j(n1, n2);
-            if (type == 2) d(n1, n2);
-        }
-    };
-
-	num_samples = max(0, num_samples);
-	num_samples2 = max(0, num_samples2);
-
-	const long long requested_changes =
-	    static_cast<long long>(num_samples) + num_samples2;
-	long long max_sample_attempts = 0;
-	if (requested_changes > 0) {
-		const long long scaled_attempt_limit =
-		    requested_changes > MAX_SAMPLE_ATTEMPTS / ATTEMPTS_PER_REQUESTED_CHANGE
-		        ? MAX_SAMPLE_ATTEMPTS
-		        : requested_changes * ATTEMPTS_PER_REQUESTED_CHANGE;
-		max_sample_attempts = clamp(
-		    scaled_attempt_limit, MIN_SAMPLE_ATTEMPTS, MAX_SAMPLE_ATTEMPTS);
-	}
-
-	long long smpl = 0;
-	for (; smpl < max_sample_attempts &&
-	       ((donereps < num_samples) || (donereps2 < num_samples2));
-	     ++smpl) {
-
-		const bool need1 = donereps < num_samples;
-		const bool need2 = donereps2 < num_samples2;
-
-		if (!need1) {
-			active_slot = 2;
-		} else if (!need2) {
-			active_slot = 1;
-		} else {
-			const double progress1 = static_cast<double>(donereps) / num_samples;
-			const double progress2 = static_cast<double>(donereps2) / num_samples2;
-			if (progress1 > progress2 + 0.02) active_slot = 2;
-			if (progress1 < progress2 - 0.02) active_slot = 1;
-		}
-		m = active_slot == 1 ? m1 : m2;
-
-        vector<int> nodes;
-
-		uniform_int_distribution<int> dist0(0, n - 1);
-		uniform_real_distribution<double> prob(0.0, 1.0);
-
-		int node1 = dist0(rng);
-
-		while (!gnif[node1]) {
-			if (prob(rng) < 0.2) break;
-			node1 = dist0(rng);
-		}
-        nodes.push_back(node1);
-
-		vector<char> blocked(adj.size(), false);
-		for (int x : nodes) blocked[x] = true;
-		blocked[node1] = true;
-	    vector<int> options;
-	    options.reserve(32);
-
-        auto pick_neighbor = [&](const vector<int>& cds) -> int {
-            for (int attempt = 0; attempt < MAX_NEIGHBOR_PICK_ATTEMPTS;
-                 ++attempt) {
-                int u = cds[rng() % cds.size()];
-                if (adj[u].empty()) continue;
-
-                int v = adj[u][rng() % adj[u].size()];
-                if (find(cds.begin(), cds.end(), v) != cds.end()) continue;
-
-                // Preserve the old 70% rejection bias for nodes not listed in
-                // data_middle1.txt, but count the rejection as an attempt.
-                if (!gnif[v] && prob(rng) < 0.7) continue;
-
-                return v;
+        auto node_position = [&](int node) {
+            for (int i = 0; i < node_count; ++i) {
+                if (nodes[i] == node) return i;
             }
             return -1;
         };
 
-        int node2 = pick_neighbor({nodes[0]});
-        if (node2 == -1) continue;
-        nodes.push_back(node2);
+        for (const EdgeOp& operation : operations) {
+            const int delta =
+                operation.action == EdgeAction::Add ? 1 : -1;
+            new_degree[node_position(operation.u)] += delta;
+            new_degree[node_position(operation.v)] += delta;
+        }
 
-        int node3 = pick_neighbor(nodes);
-        if (node3 == -1) continue;
-        nodes.push_back(node3);
-
-        int node4 = pick_neighbor(nodes);
-        if (node4 == -1) continue;
-        nodes.push_back(node4);
-
-        shuffle (nodes.begin(), nodes.end(), rng);
-
-        vector<vector<int>> sub(4, vector<int>(4, 0));
-        for (int a = 0; a < 4; a++) {
-            for (int b = 0; b < a; b++) {
-                int u = nodes[a], v = nodes[b];
-                sub[a][b] = sub[b][a] = bvv[u][v];
+        for (int i = 0; i < node_count; ++i) {
+            if (!degree_allowed(nodes[i], old_degree[i], new_degree[i])) {
+                return false;
             }
         }
-        int gid = get_graph_id(sub);
-		cntr[gid-5]++;
 
-		if (m == 60) {
-	        int node5 = pick_neighbor(nodes);
-	        if (node5 == -1) continue;
-    	    nodes.push_back(node5);
+        array<int, MAX_RELATED_DEGREES> related_degree{};
+        array<int, MAX_RELATED_DEGREES> proposed_histogram{};
+        int related_count = 0;
 
-	        vector<vector<int>> sub5(5, vector<int>(5, 0));
-	        for (int a = 0; a < 5; a++) {
-	            for (int b = 0; b < a; b++) {
-	                int u = nodes[a], v = nodes[b];
-	                sub5[a][b] = sub5[b][a] = bvv[u][v];
-	            }
-	        }
-
-			if (sub5[0][1]+sub5[0][2]+sub5[0][3]+sub5[0][4]+sub5[1][2]+sub5[1][3]+sub5[1][4]+sub5[2][3]+sub5[2][4]+sub5[3][4] == 9) {
-				int cpt1 = 1, cpt2 = 0;
-				for (int cptl1 = 0; cptl1 < 5; cptl1++){
-					for (int cptl2 = 0; cptl2 < cptl1; cptl2++){
-						if (sub5[cptl1][cptl2] == 0){
-							cpt1 = cptl1; cpt2 = cptl2;
-						}
-					}
-				}
-				op({{1,nodes[cpt1],nodes[cpt2]}});
-			}
-		}
-
-		if (gid == 10 && ((43 <= m && m <= 47) || m == 59)){
-			int u = -1, v = -1, w = -1, z = -1;
-			u = nodes[0];
-			v = nodes[1];
-			w = nodes[2];
-			z = nodes[3];
-			if (m==43) { op({{2,u,v}}); }
-			if (m==44) { op({{2,u,v}, {2,w,z}}); }
-			if (m==45) { op({{2,u,z}, {2,v,z}}); }
-			if (m==46) { op({{2,u,v}, {2,w,z}, {2,u,z}}); }
-			if (m==47) { op({{2,u,v}, {2,u,w}, {2,v,w}}); }
-			if (m==59) {
-				uniform_int_distribution<int> dist(0, adj[u].size() - 1);
-				int uuu = adj[u][dist(rng)];
-				op({{1,uuu,v}, {1,uuu,w}, {1,uuu,z}});
-			}
-		}
-		if (gid == 9 && (m == 24 || m == 31 || m == 55 || (48 <= m && m <= 49))){
-			int u = -1, v = -1, w = -1, z = -1;
-			vector<int> blanks;
-			for (int i = 0; i < 4; i++){
-				if (sub[i][0] + sub[i][1] + sub[i][2] + sub[i][3] == 2) blanks.push_back(i);
-			}
-			u = nodes[blanks[0]];
-			v = nodes[blanks[1]];
-			for (int i = 0; i < 4; i++){
-				if (sub[i][0] + sub[i][1] + sub[i][2] + sub[i][3] == 3) blanks.push_back(i);
-			}
-			w = nodes[blanks[2]];
-			z = nodes[blanks[3]];
-			if (m==24) { op({{1,u,v}, {2,u,z}}); }
-			if (m==31) { op({{1,u,v}}); }
-			if (m==48) { op({{2,z,w}}); }
-			if (m==49) { op({{2,u,w}}); }
-			if (m==55) {
-			    uniform_int_distribution<int> dist(0, adj[u].size() - 1);
-				int uuu = adj[u][dist(rng)];
-				if (deg[uuu] != 1) op({{1,u,v}, {2,u,uuu}});
-			}
-		}
-        if (gid == 8 && ( (21 <= m && m <= 23) || m == 27 || m == 40 || m == 32 || m == 50 || m == 57 || m == 58)){
-			int u = -1, v = -1, w = -1, z = -1;
-            vector<int> dig;
-            w = nodes[0];
-            for (int i = 1; i < 4; i++){
-                if (sub[0][i] == 1) dig.push_back(i);
-                else z = nodes[i];
+        auto related_position = [&](int degree) {
+            for (int i = 0; i < related_count; ++i) {
+                if (related_degree[i] == degree) return i;
             }
-            v = nodes[dig[0]];
-            u = nodes[dig[1]];
-			if (m==21) { op({{1,u,v}, {1,w,z}, {2,u,z}, {2,w,v}}); }
-			if (m==22) { op({{1,v,u}, {1,z,w}, {2,z,v}, {2,w,v}}); }
-			if (m==23) { op({{1,u,v}, {2,v,w}}); }
-			if (m==32) { op({{1,u,v}}); }
-			if (m==27) { op({{1,u,v}, {1,z,w}}); }
-			if (m==40) { op({{2,u,z}}); }
-			if (m==50) { op({{1,w,z}, {2,v,w}, {2,u,w}}); }
-            if (m==57) {
-                uniform_int_distribution<int> dist(0, adj[w].size() - 1);
-                int ww1 = adj[w][dist(rng)];
-                uniform_int_distribution<int> dist2(0, adj[z].size() - 1);
-                int zz1 = adj[z][dist2(rng)];
-                if (ww1 != zz1 && deg[ww1] != 1 && deg[zz1] != 1) op({{1,z,w}, {1,u,v}, {2,w,ww1}, {2,z,zz1}});
-            }
-			if (m==58) {
-				op({{2,u,z}, {2,u,w}});
-			}
-		}
-        if (gid == 7 && ( (10 <= m && m <= 17) || m == 28 || m == 33 || m == 41 || m == 42 || m == 51 || m == 56)){
-			int u = -1, v = -1, w = -1, z = -1;
-			vector<int> subsum(4, 0), par;
- 			for (int i = 0; i < 4; i++){
-				subsum[i] = sub[i][0] + sub[i][1] + sub[i][2] + sub[i][3];
-                if (subsum[i] == 1) w = nodes[i];
-                else if (subsum[i] == 3) z = nodes[i];
-				else par.push_back(i);
-            }
-			u = nodes[par[0]];
-			v = nodes[par[1]];
-			if (m==10) { op({{1,w,v}, {2,u,v}}); }
-			if (m==11) { op({{1,w,u}, {1,w,v}, {2,z,v}, {2,z,u}}); }
-			if (m==12) { op({{1,w,u}, {1,w,v}, {2,v,u}, {2,z,u}}); }
-			if (m==13) { op({{1,u,w}, {1,v,w}, {2,z,w}, {2,v,z}}); }
-			if (m==14) { op({{1,u,w}, {2,v,z}}); }
-			if (m==15) { op({{1,u,w}, {2,w,z}}); }
-			if (m==28) { op({{1,u,w}, {1,v,w}}); }
-			if (m==16) { op({{1,u,w}, {1,v,w}, {2,w,z}, {2,u,v}}); }
-			if (m==17) { op({{1,w,u}, {2,z,u}}); }
-			if (m==33) { op({{1,u,w}}); }
-			if (m==41) { op({{2,u,z}}); }
-			if (m==42) { op({{2,u,v}}); }
-			if (m==51 && deg[w] != 1) { op({{2,z,w}}); }
-        	if (m==56) {
-			    uniform_int_distribution<int> dist(0, adj[w].size() - 1);
-				int ww1 = adj[w][dist(rng)];
-				int ww2 = adj[w][dist(rng)];
-				if (ww1 != ww2 && deg[ww1] != 1 && deg[ww2] != 1)op({{1,v,w}, {1,u,w}, {2,w,ww1}, {2,w,ww2}});
-			}
-		}
+            related_degree[related_count] = degree;
+            proposed_histogram[related_count] =
+                current_histogram_[degree];
+            return related_count++;
+        };
 
-
-		if (gid == 6 && ( (1 <= m && m <= 9) || 29 == m || m == 34 || m == 35 || m == 37 || m == 38 || m == 52)){
-			int u = -1, v = -1, w = -1, z = -1;
-			vector<int> singles;
-			for (int i = 0; i < 4; i++){
-				if (sub[i][0] + sub[i][1] + sub[i][2] + sub[i][3] == 1) singles.push_back(i);
-			}
-			z = nodes[singles[1]];
-			u = nodes[singles[0]];
-			for (int i = 0; i < 4; i++){
-				if (sub[i][singles[1]] == 1) v = nodes[i];
-			}
-			for (int i = 0; i < 4; i++){
-				if (sub[i][singles[0]] == 1) w = nodes[i];
-			}
-			if (m==1)  { op({{1,w,z}, {2,w,v}}); }
-			if (m==2)  { op({{1,u,z}, {2,w,u}}); }
-			if (m==3)  { op({{1,u,z}, {1,w,z}, {2,u,w}, {2,v,z}}); }
-			if (m==4)  { op({{1,u,v}, {1,w,z}, {2,u,w}, {2,v,z}}); }
-			if (m==5)  { op({{1,u,v}, {1,w,z}, {2,u,w}, {2,v,w}}); }
-			if (m==6)  { op({{1,u,z}, {2,w,v}}); }
-			if (m==7)  { op({{1,w,z}, {1,z,u}, {2,w,v}, {2,w,u}}); }
-			if (m==8)  { op({{1,w,z}, {2,v,z}}); }
-			if (m==9)  { op({{1,u,v}, {1,u,z}, {2,v,z}, {2,w,v}}); }
-			if (m==29) { op({{1,u,v}, {1,u,z}, {1,w,z}}); }
-			if (m==34) { op({{1,u,v}, {1,w,z}}); }
-			if (m==35) { op({{1,u,z}, {1,w,z}}); }
-			if (m==37) { op({{1,u,z}}); }
-			if (m==38) { op({{1,u,v}}); }
-			if (m==52 && deg[z] != 1) { op({{2,z,v}}); }
-		}
-
-		if (gid == 5 && ( (18 <= m && m <= 20) || m == 36 || m == 30 || m == 39 || m == 53 || m == 54)) {
-			int u = -1, v = -1, w = -1, z = -1, center = -1;
-            vector<int> subsum(4, 0), lone;
-			for (int i = 0; i < 4; i++){
-                subsum[i] = sub[i][0] + sub[i][1] + sub[i][2] + sub[i][3];
-                if (subsum[i] == 3) {center = i;}
-				else if (subsum[i] == 1) lone.push_back(i);
+        for (int i = 0; i < node_count; ++i) {
+            related_position(old_degree[i]);
+            related_position(new_degree[i]);
+        }
+        for (int i = 0; i < node_count; ++i) {
+            proposed_histogram[related_position(old_degree[i])]--;
+            proposed_histogram[related_position(new_degree[i])]++;
+        }
+        for (int i = 0; i < related_count; ++i) {
+            if (!histogram_allowed(
+                    related_degree[i], proposed_histogram[i])) {
+                return false;
             }
-			u = nodes[lone[0]];
-			v = nodes[lone[1]];
-			w = nodes[lone[2]];
-			z = nodes[center];
-			if (m==18) { op({{1,w,u}, {1,u,v}, {2,z,w}, {2,z,v}}); }
-			if (m==19) { op({{1,u,v}, {1,w,v}, {2,w,z}, {2,z,v}}); }
-			if (m==20) { op({{1,v,w}, {2,z,w}}); }
-			if (m==30) { op({{1,u,v}, {1,w,v}, {1,u,w}}); }
-			if (m==36) { op({{1,u,v}, {1,w,v}}); }
-			if (m==39) { op({{1,u,v}}); }
-			if (m==53 && deg[w] != 1) { op({{2,z,w}}); }
-			if (m==54 && deg[w] != 1) { op({{1,u,v}, {2,z,w}}); }
-		}
+        }
+
+        // Validation is complete. Mutating the graph can no longer leave a
+        // half-applied operation.
+        for (const EdgeOp& operation : operations) {
+            if (operation.action == EdgeAction::Add) {
+                graph_.add_edge_unchecked(operation.u, operation.v);
+            } else {
+                graph_.remove_edge_unchecked(operation.u, operation.v);
+            }
+        }
+
+        for (int i = 0; i < node_count; ++i) {
+            current_histogram_[old_degree[i]]--;
+            current_histogram_[new_degree[i]]++;
+            if (graph_.degree[nodes[i]] != new_degree[i]) {
+                throw runtime_error("internal degree update mismatch");
+            }
+        }
+
+        if (active_slot_ == 1 && done1_ < requested1_) {
+            done1_++;
+        } else if (active_slot_ == 2 && done2_ < requested2_) {
+            done2_++;
+        }
+        return true;
     }
 
-	if (donereps < num_samples || donereps2 < num_samples2) {
-		cerr << "Warning: sample-attempt limit reached after " << smpl
-		     << " attempts before all requested changes were completed.\n";
-	}
+    void sample_one(int mode) {
+        array<int, 5> nodes{};
+        int count = 0;
 
-	double sumsss = 0;
-	for (auto i : cntr) sumsss += i;
-	//for (int i = 0; i<6; i++) {cntr[i] /= sumsss; cerr << cntr[i] << " ";} cerr << sumsss << endl;
-	//cerr << lklk1 << " " << lklk2 << " " << lklk3 << " " << lklk4 << " " << endl;
+        nodes[count++] = pick_first_node();
+        if (nodes[0] < 0) return;
 
-	return {donereps, donereps2, smpl};
-}
+        for (; count < 4; ++count) {
+            const int next = pick_neighbor(nodes, count);
+            if (next < 0) return;
+            nodes[count] = next;
+        }
+        shuffle_first_four(nodes);
 
-void readGraph(const string& filename,
-               vector<vector<int>>& adj,
-               vector<vector<char>>& adjMat) {
-    ifstream infile(filename);
-    if (!infile.is_open()) {
-        cerr << "Error: cannot open file '" << filename << "'\n";
-        exit(1);
+        if (mode == 60) {
+            const int fifth = pick_neighbor(nodes, 4);
+            if (fifth < 0) return;
+            nodes[4] = fifth;
+
+            int induced_edges = 0;
+            int missing_a = -1;
+            int missing_b = -1;
+            for (int a = 0; a < 5; ++a) {
+                for (int b = 0; b < a; ++b) {
+                    if (graph_.matrix.get(nodes[a], nodes[b])) {
+                        induced_edges++;
+                    } else {
+                        missing_a = a;
+                        missing_b = b;
+                    }
+                }
+            }
+            if (induced_edges == 9) {
+                try_operation({
+                    {EdgeAction::Add, nodes[missing_a], nodes[missing_b]},
+                });
+            }
+            return;
+        }
+
+        const Sub4 sub = build_sub4(nodes);
+        const int gid = graph_id_from_sub4(sub);
+        if (REQUIRED_GID[mode] != gid) return;
+
+        switch (gid) {
+            case 10:
+                apply_from_clique(mode, nodes);
+                break;
+            case 9:
+                apply_from_diamond(mode, nodes, sub);
+                break;
+            case 8:
+                apply_from_cycle(mode, nodes, sub);
+                break;
+            case 7:
+                apply_from_paw(mode, nodes, sub);
+                break;
+            case 6:
+                apply_from_path(mode, nodes, sub);
+                break;
+            case 5:
+                apply_from_claw(mode, nodes, sub);
+                break;
+            default:
+                break;
+        }
     }
 
-    vector<pair<int, int>> edgess;
-    string line;
-    int u, v;
-    int mx = -1;
+    void apply_from_clique(int mode, const array<int, 5>& nodes) {
+        const int u = nodes[0];
+        const int v = nodes[1];
+        const int w = nodes[2];
+        const int z = nodes[3];
 
-    while (getline(infile, line)) {
-        istringstream iss(line);
-        if (!(iss >> u >> v)) continue;
-
-        edgess.emplace_back(u, v);
-        mx = max(mx, max(u, v));
+        switch (mode) {
+            case 43:
+                try_operation({{EdgeAction::Remove, u, v}});
+                break;
+            case 44:
+                try_operation({
+                    {EdgeAction::Remove, u, v},
+                    {EdgeAction::Remove, w, z},
+                });
+                break;
+            case 45:
+                try_operation({
+                    {EdgeAction::Remove, u, z},
+                    {EdgeAction::Remove, v, z},
+                });
+                break;
+            case 46:
+                try_operation({
+                    {EdgeAction::Remove, u, v},
+                    {EdgeAction::Remove, w, z},
+                    {EdgeAction::Remove, u, z},
+                });
+                break;
+            case 47:
+                try_operation({
+                    {EdgeAction::Remove, u, v},
+                    {EdgeAction::Remove, u, w},
+                    {EdgeAction::Remove, v, w},
+                });
+                break;
+            case 59: {
+                const int outside = random_neighbor(u);
+                if (outside >= 0) {
+                    try_operation({
+                        {EdgeAction::Add, outside, v},
+                        {EdgeAction::Add, outside, w},
+                        {EdgeAction::Add, outside, z},
+                    });
+                }
+                break;
+            }
+            default:
+                break;
+        }
     }
 
-    int n = mx + 1;
+    void apply_from_diamond(
+        int mode, const array<int, 5>& nodes, const Sub4& sub) {
+        array<int, 2> degree2{};
+        array<int, 2> degree3{};
+        int count2 = 0;
+        int count3 = 0;
+        for (int i = 0; i < 4; ++i) {
+            const int degree = sub_degree(sub, i);
+            if (degree == 2 && count2 < 2) degree2[count2++] = i;
+            if (degree == 3 && count3 < 2) degree3[count3++] = i;
+        }
+        if (count2 != 2 || count3 != 2) return;
 
-    adj.assign(n, {});
-    adjMat.assign(n, vector<char>(n, 0));
+        const int u = nodes[degree2[0]];
+        const int v = nodes[degree2[1]];
+        const int w = nodes[degree3[0]];
+        const int z = nodes[degree3[1]];
 
-    for (auto [u, v] : edgess) {
-        adj[u].push_back(v);
-        adj[v].push_back(u);
-        adjMat[u][v] = adjMat[v][u] = 1;
+        switch (mode) {
+            case 24:
+                try_operation({
+                    {EdgeAction::Add, u, v},
+                    {EdgeAction::Remove, u, z},
+                });
+                break;
+            case 31:
+                try_operation({{EdgeAction::Add, u, v}});
+                break;
+            case 48:
+                try_operation({{EdgeAction::Remove, z, w}});
+                break;
+            case 49:
+                try_operation({{EdgeAction::Remove, u, w}});
+                break;
+            case 55: {
+                const int outside = random_neighbor(u);
+                if (outside >= 0 && graph_.degree[outside] != 1) {
+                    try_operation({
+                        {EdgeAction::Add, u, v},
+                        {EdgeAction::Remove, u, outside},
+                    });
+                }
+                break;
+            }
+            default:
+                break;
+        }
     }
-}
-// Return every connected component as a list of node IDs.
-vector<vector<int>> get_connected_components(
-    const vector<vector<int>>& adj) {
-    const int n = static_cast<int>(adj.size());
-    vector<char> visited(n, 0);
+
+    void apply_from_cycle(
+        int mode, const array<int, 5>& nodes, const Sub4& sub) {
+        const int w = nodes[0];
+        array<int, 2> adjacent{};
+        int adjacent_count = 0;
+        int z = -1;
+        for (int i = 1; i < 4; ++i) {
+            if (sub[0][i]) {
+                if (adjacent_count < 2) adjacent[adjacent_count++] = i;
+            } else {
+                z = nodes[i];
+            }
+        }
+        if (adjacent_count != 2 || z < 0) return;
+
+        const int v = nodes[adjacent[0]];
+        const int u = nodes[adjacent[1]];
+
+        switch (mode) {
+            case 21:
+                try_operation({
+                    {EdgeAction::Add, u, v},
+                    {EdgeAction::Add, w, z},
+                    {EdgeAction::Remove, u, z},
+                    {EdgeAction::Remove, w, v},
+                });
+                break;
+            case 22:
+                try_operation({
+                    {EdgeAction::Add, v, u},
+                    {EdgeAction::Add, z, w},
+                    {EdgeAction::Remove, z, v},
+                    {EdgeAction::Remove, w, v},
+                });
+                break;
+            case 23:
+                try_operation({
+                    {EdgeAction::Add, u, v},
+                    {EdgeAction::Remove, v, w},
+                });
+                break;
+            case 27:
+                try_operation({
+                    {EdgeAction::Add, u, v},
+                    {EdgeAction::Add, z, w},
+                });
+                break;
+            case 32:
+                try_operation({{EdgeAction::Add, u, v}});
+                break;
+            case 40:
+                try_operation({{EdgeAction::Remove, u, z}});
+                break;
+            case 50:
+                try_operation({
+                    {EdgeAction::Add, w, z},
+                    {EdgeAction::Remove, v, w},
+                    {EdgeAction::Remove, u, w},
+                });
+                break;
+            case 57: {
+                const int outside_w = random_neighbor(w);
+                const int outside_z = random_neighbor(z);
+                if (outside_w >= 0 && outside_z >= 0 &&
+                    outside_w != outside_z &&
+                    graph_.degree[outside_w] != 1 &&
+                    graph_.degree[outside_z] != 1) {
+                    try_operation({
+                        {EdgeAction::Add, z, w},
+                        {EdgeAction::Add, u, v},
+                        {EdgeAction::Remove, w, outside_w},
+                        {EdgeAction::Remove, z, outside_z},
+                    });
+                }
+                break;
+            }
+            case 58:
+                try_operation({
+                    {EdgeAction::Remove, u, z},
+                    {EdgeAction::Remove, u, w},
+                });
+                break;
+            default:
+                break;
+        }
+    }
+
+    void apply_from_paw(
+        int mode, const array<int, 5>& nodes, const Sub4& sub) {
+        int w = -1;
+        int z = -1;
+        array<int, 2> middle{};
+        int middle_count = 0;
+        for (int i = 0; i < 4; ++i) {
+            const int degree = sub_degree(sub, i);
+            if (degree == 1) {
+                w = nodes[i];
+            } else if (degree == 3) {
+                z = nodes[i];
+            } else if (degree == 2 && middle_count < 2) {
+                middle[middle_count++] = i;
+            }
+        }
+        if (w < 0 || z < 0 || middle_count != 2) return;
+
+        const int u = nodes[middle[0]];
+        const int v = nodes[middle[1]];
+
+        switch (mode) {
+            case 10:
+                try_operation({
+                    {EdgeAction::Add, w, v},
+                    {EdgeAction::Remove, u, v},
+                });
+                break;
+            case 11:
+                try_operation({
+                    {EdgeAction::Add, w, u},
+                    {EdgeAction::Add, w, v},
+                    {EdgeAction::Remove, z, v},
+                    {EdgeAction::Remove, z, u},
+                });
+                break;
+            case 12:
+                try_operation({
+                    {EdgeAction::Add, w, u},
+                    {EdgeAction::Add, w, v},
+                    {EdgeAction::Remove, v, u},
+                    {EdgeAction::Remove, z, u},
+                });
+                break;
+            case 13:
+                try_operation({
+                    {EdgeAction::Add, u, w},
+                    {EdgeAction::Add, v, w},
+                    {EdgeAction::Remove, z, w},
+                    {EdgeAction::Remove, v, z},
+                });
+                break;
+            case 14:
+                try_operation({
+                    {EdgeAction::Add, u, w},
+                    {EdgeAction::Remove, v, z},
+                });
+                break;
+            case 15:
+                try_operation({
+                    {EdgeAction::Add, u, w},
+                    {EdgeAction::Remove, w, z},
+                });
+                break;
+            case 16:
+                try_operation({
+                    {EdgeAction::Add, u, w},
+                    {EdgeAction::Add, v, w},
+                    {EdgeAction::Remove, w, z},
+                    {EdgeAction::Remove, u, v},
+                });
+                break;
+            case 17:
+                try_operation({
+                    {EdgeAction::Add, w, u},
+                    {EdgeAction::Remove, z, u},
+                });
+                break;
+            case 28:
+                try_operation({
+                    {EdgeAction::Add, u, w},
+                    {EdgeAction::Add, v, w},
+                });
+                break;
+            case 33:
+                try_operation({{EdgeAction::Add, u, w}});
+                break;
+            case 41:
+                try_operation({{EdgeAction::Remove, u, z}});
+                break;
+            case 42:
+                try_operation({{EdgeAction::Remove, u, v}});
+                break;
+            case 51:
+                if (graph_.degree[w] != 1) {
+                    try_operation({{EdgeAction::Remove, z, w}});
+                }
+                break;
+            case 56: {
+                const int outside1 = random_neighbor(w);
+                const int outside2 = random_neighbor(w);
+                if (outside1 >= 0 && outside2 >= 0 &&
+                    outside1 != outside2 &&
+                    graph_.degree[outside1] != 1 &&
+                    graph_.degree[outside2] != 1) {
+                    try_operation({
+                        {EdgeAction::Add, v, w},
+                        {EdgeAction::Add, u, w},
+                        {EdgeAction::Remove, w, outside1},
+                        {EdgeAction::Remove, w, outside2},
+                    });
+                }
+                break;
+            }
+            default:
+                break;
+        }
+    }
+
+    void apply_from_path(
+        int mode, const array<int, 5>& nodes, const Sub4& sub) {
+        array<int, 2> leaves{};
+        int leaf_count = 0;
+        for (int i = 0; i < 4; ++i) {
+            if (sub_degree(sub, i) == 1 && leaf_count < 2) {
+                leaves[leaf_count++] = i;
+            }
+        }
+        if (leaf_count != 2) return;
+
+        const int u = nodes[leaves[0]];
+        const int z = nodes[leaves[1]];
+        int v = -1;
+        int w = -1;
+        for (int i = 0; i < 4; ++i) {
+            if (sub[i][leaves[1]]) v = nodes[i];
+            if (sub[i][leaves[0]]) w = nodes[i];
+        }
+        if (v < 0 || w < 0) return;
+
+        switch (mode) {
+            case 1:
+                try_operation({
+                    {EdgeAction::Add, w, z},
+                    {EdgeAction::Remove, w, v},
+                });
+                break;
+            case 2:
+                try_operation({
+                    {EdgeAction::Add, u, z},
+                    {EdgeAction::Remove, w, u},
+                });
+                break;
+            case 3:
+                try_operation({
+                    {EdgeAction::Add, u, z},
+                    {EdgeAction::Add, w, z},
+                    {EdgeAction::Remove, u, w},
+                    {EdgeAction::Remove, v, z},
+                });
+                break;
+            case 4:
+                try_operation({
+                    {EdgeAction::Add, u, v},
+                    {EdgeAction::Add, w, z},
+                    {EdgeAction::Remove, u, w},
+                    {EdgeAction::Remove, v, z},
+                });
+                break;
+            case 5:
+                try_operation({
+                    {EdgeAction::Add, u, v},
+                    {EdgeAction::Add, w, z},
+                    {EdgeAction::Remove, u, w},
+                    {EdgeAction::Remove, v, w},
+                });
+                break;
+            case 6:
+                try_operation({
+                    {EdgeAction::Add, u, z},
+                    {EdgeAction::Remove, w, v},
+                });
+                break;
+            case 7:
+                try_operation({
+                    {EdgeAction::Add, w, z},
+                    {EdgeAction::Add, z, u},
+                    {EdgeAction::Remove, w, v},
+                    {EdgeAction::Remove, w, u},
+                });
+                break;
+            case 8:
+                try_operation({
+                    {EdgeAction::Add, w, z},
+                    {EdgeAction::Remove, v, z},
+                });
+                break;
+            case 9:
+                try_operation({
+                    {EdgeAction::Add, u, v},
+                    {EdgeAction::Add, u, z},
+                    {EdgeAction::Remove, v, z},
+                    {EdgeAction::Remove, w, v},
+                });
+                break;
+            case 29:
+                try_operation({
+                    {EdgeAction::Add, u, v},
+                    {EdgeAction::Add, u, z},
+                    {EdgeAction::Add, w, z},
+                });
+                break;
+            case 34:
+                try_operation({
+                    {EdgeAction::Add, u, v},
+                    {EdgeAction::Add, w, z},
+                });
+                break;
+            case 35:
+                try_operation({
+                    {EdgeAction::Add, u, z},
+                    {EdgeAction::Add, w, z},
+                });
+                break;
+            case 37:
+                try_operation({{EdgeAction::Add, u, z}});
+                break;
+            case 38:
+                try_operation({{EdgeAction::Add, u, v}});
+                break;
+            case 52:
+                if (graph_.degree[z] != 1) {
+                    try_operation({{EdgeAction::Remove, z, v}});
+                }
+                break;
+            default:
+                break;
+        }
+    }
+
+    void apply_from_claw(
+        int mode, const array<int, 5>& nodes, const Sub4& sub) {
+        array<int, 3> leaves{};
+        int leaf_count = 0;
+        int center = -1;
+        for (int i = 0; i < 4; ++i) {
+            const int degree = sub_degree(sub, i);
+            if (degree == 3) {
+                center = i;
+            } else if (degree == 1 && leaf_count < 3) {
+                leaves[leaf_count++] = i;
+            }
+        }
+        if (center < 0 || leaf_count != 3) return;
+
+        const int u = nodes[leaves[0]];
+        const int v = nodes[leaves[1]];
+        const int w = nodes[leaves[2]];
+        const int z = nodes[center];
+
+        switch (mode) {
+            case 18:
+                try_operation({
+                    {EdgeAction::Add, w, u},
+                    {EdgeAction::Add, u, v},
+                    {EdgeAction::Remove, z, w},
+                    {EdgeAction::Remove, z, v},
+                });
+                break;
+            case 19:
+                try_operation({
+                    {EdgeAction::Add, u, v},
+                    {EdgeAction::Add, w, v},
+                    {EdgeAction::Remove, w, z},
+                    {EdgeAction::Remove, z, v},
+                });
+                break;
+            case 20:
+                try_operation({
+                    {EdgeAction::Add, v, w},
+                    {EdgeAction::Remove, z, w},
+                });
+                break;
+            case 30:
+                try_operation({
+                    {EdgeAction::Add, u, v},
+                    {EdgeAction::Add, w, v},
+                    {EdgeAction::Add, u, w},
+                });
+                break;
+            case 36:
+                try_operation({
+                    {EdgeAction::Add, u, v},
+                    {EdgeAction::Add, w, v},
+                });
+                break;
+            case 39:
+                try_operation({{EdgeAction::Add, u, v}});
+                break;
+            case 53:
+                if (graph_.degree[w] != 1) {
+                    try_operation({{EdgeAction::Remove, z, w}});
+                }
+                break;
+            case 54:
+                if (graph_.degree[w] != 1) {
+                    try_operation({
+                        {EdgeAction::Add, u, v},
+                        {EdgeAction::Remove, z, w},
+                    });
+                }
+                break;
+            default:
+                break;
+        }
+    }
+};
+
+vector<vector<int>> connected_components(const Graph& graph) {
+    vector<uint8_t> visited(graph.n, 0);
     vector<vector<int>> components;
+    vector<int> stack;
+    stack.reserve(graph.n);
 
-    for (int start = 0; start < n; ++start) {
+    for (int start = 0; start < graph.n; ++start) {
         if (visited[start]) continue;
 
         vector<int> component;
-        queue<int> q;
-        q.push(start);
+        stack.clear();
+        stack.push_back(start);
         visited[start] = 1;
 
-        while (!q.empty()) {
-            const int u = q.front();
-            q.pop();
+        while (!stack.empty()) {
+            const int u = stack.back();
+            stack.pop_back();
             component.push_back(u);
-
-            for (int v : adj[u]) {
+            for (int v : graph.adj[u]) {
                 if (!visited[v]) {
                     visited[v] = 1;
-                    q.push(v);
+                    stack.push_back(v);
                 }
             }
         }
-
         components.push_back(move(component));
     }
-
     return components;
 }
 
-// This runs only after all requested transformations are finished. If the
-// graph has k components, it adds exactly k-1 bridge edges. On each step it
-// chooses a random node X in the current largest component and connects X to a
-// random node in one randomly chosen remaining component.
-void reconnect_graph(vector<vector<int>>& adj,
-                     vector<vector<char>>& bvv) {
-    vector<vector<int>> components = get_connected_components(adj);
+void reconnect_graph(Graph& graph, FastRng& rng) {
+    vector<vector<int>> components = connected_components(graph);
     if (components.size() <= 1) return;
 
-    const size_t initial_component_count = components.size();
-    cerr << "Graph is disconnected: " << initial_component_count
+    const size_t initial_count = components.size();
+    cerr << "Graph is disconnected: " << initial_count
          << " connected components.\n";
 
-    random_device rd;
-    mt19937 rng(rd());
-
     while (components.size() > 1) {
-        // Put the current largest component at index 0.
-        const auto largest_it = max_element(
+        const auto largest = max_element(
             components.begin(), components.end(),
-            [](const vector<int>& a, const vector<int>& b) {
-                return a.size() < b.size();
+            [](const vector<int>& lhs, const vector<int>& rhs) {
+                return lhs.size() < rhs.size();
             });
-        iter_swap(components.begin(), largest_it);
+        iter_swap(components.begin(), largest);
 
-        uniform_int_distribution<size_t> other_component_dist(
-            1, components.size() - 1);
-        const size_t other_index = other_component_dist(rng);
+        const size_t other_index = 1 +
+            rng.bounded(static_cast<uint64_t>(components.size() - 1));
+        const int x = components[0][rng.bounded(components[0].size())];
+        const int y = components[other_index][
+            rng.bounded(components[other_index].size())];
 
-        uniform_int_distribution<size_t> x_dist(
-            0, components[0].size() - 1);
-        uniform_int_distribution<size_t> y_dist(
-            0, components[other_index].size() - 1);
-
-        const int x = components[0][x_dist(rng)];
-        const int y = components[other_index][y_dist(rng)];
-
-        // Nodes in different components cannot already share an edge.
-        adj[x].push_back(y);
-        adj[y].push_back(x);
-        bvv[x][y] = bvv[y][x] = 1;
-
-        // The bridge merges these two components. The merged component remains
-        // at index 0 and is reconsidered as the largest on the next iteration.
+        graph.add_edge_unchecked(x, y);
         components[0].insert(
             components[0].end(),
             components[other_index].begin(),
@@ -734,224 +1415,111 @@ void reconnect_graph(vector<vector<int>>& adj,
         components.pop_back();
     }
 
-    cerr << "Added " << (initial_component_count - 1)
+    cerr << "Added " << (initial_count - 1)
          << " bridge edges to reconnect the graph.\n";
 }
 
-ld rmsewc(vector<vector<int>> adj, vector<ld> x, ld evl) {
-	int n = adj.size();
-	vector<ld> y(n);
-	ld rmse = 0;
-	for (int i = 0; i < n; i++) {
-	    for (int nei : adj[i]) {
-	        y[i] += x[nei];
-	    }
-		y[i] /= evl;
-		ld d = log(y[i]) - log(x[i]);
-		rmse += d*d;
-	}
-	return sqrt(rmse/n);
+int parse_int(const char* text, const char* name) {
+    try {
+        size_t used = 0;
+        const string value(text);
+        const long long parsed = stoll(value, &used);
+        if (used != value.size() ||
+            parsed < numeric_limits<int>::min() ||
+            parsed > numeric_limits<int>::max()) {
+            throw invalid_argument("out of range");
+        }
+        return static_cast<int>(parsed);
+    } catch (const exception&) {
+        throw runtime_error(string("invalid integer for ") + name + ": '" + text + "'");
+    }
 }
 
-
-
-pair<ld, vector<ld>> evlevc(vector<vector<int>> adj) {
-
-	int n = adj.size();
-    vector<ld> x(n);
-
-    mt19937 rng(chrono::steady_clock::now().time_since_epoch().count());
-    uniform_real_distribution<ld> dist(0.0, 1.0);
-
-    for (int i = 0; i < n; i++)
-        x[i] = dist(rng);
-
-    ld norm = 0;
-    for (ld val : x)
-        norm += val * val;
-
-    norm = sqrt(norm);
-
-    for (ld &val : x)
-        val /= norm;
-
-    ld prev_lambda = 0;
-
-    for (int iter = 1; iter <= MAX_ITERS; iter++) {
-        vector<ld> y(n, 0.0);
-
-        for (int i = 0; i < n; i++) {
-            for (int nei : adj[i]) {
-                y[i] += x[nei];
-            }
-        }
-
-        ld lambda = 0;
-        for (int i = 0; i < n; i++) {
-            lambda += x[i] * y[i];
-        }
-
-        norm = 0;
-        for (ld val : y)
-            norm += val * val;
-
-        norm = sqrt(norm);
-
-        if (norm < EPS) {
-            cerr << "Zero vector encountered.\n";
-            return {0, x};
-        }
-
-        for (ld &val : y)
-            val /= norm;
-
-		if (abs(lambda - prev_lambda) < EPS) {
-		    return {lambda, x};
-		}
-
-        prev_lambda = lambda;
-        x = move(y);
-    }
-
-    // stdout is reserved exclusively for the generated edge list.
-    // Diagnostics must go to stderr or they become invalid lines in the graph.
-    cerr << fixed << setprecision(12);
-    cerr << "Largest eigenvalue (approx): " << prev_lambda << '\n';
-    cerr << "Reached max iterations.\n";
-
-    return {prev_lambda, x};
-}
-
-vector<ld> matchsortld(vector<ld> a, vector<ld> b) {
-    int n = b.size();
-
-    sort(a.begin(), a.end());
-
-    vector<int> idx(n);
-    iota(idx.begin(), idx.end(), 0);
-
-    sort(idx.begin(), idx.end(), [&](int i, int j) {
-        return b[i] < b[j];
-    });
-
-    vector<ld> res(n);
-    for (int k = 0; k < n; k++) {
-        res[idx[k]] = a[k];
-    }
-
-    return res;
-}
-
-
-vector<int> matchsortint(vector<int> a, vector<int> b) {
-    int n = b.size();
-
-    sort(a.begin(), a.end());
-
-    vector<int> idx(n);
-    iota(idx.begin(), idx.end(), 0);
-
-    sort(idx.begin(), idx.end(), [&](int i, int j) {
-        return b[i] < b[j];
-    });
-
-    vector<int> res(n);
-    for (int k = 0; k < n; k++) {
-        res[idx[k]] = a[k];
-    }
-
-    return res;
-}
-
-vector<int> readGoodNodes(int k) {
-    ifstream infile("data_middle1.txt");
-    if (!infile.is_open()) {
-        cerr << "Error: cannot open file data_middle.txt \n";
-        exit(1);
-    }
-
-    vector<int> goodnodes;
-
-    for (int i = 0; ; i++) {
-        int a[15];
-
-        bool ok = true;
-        for (int j = 0; j < 15; j++) {
-            if (!(infile >> a[j])) {
-                ok = false;
-                break;
-            }
-        }
-
-        if (!ok) break;
-
-        if (a[k] > 0) {
-            goodnodes.push_back(i);
-        }
-    }
-
-    return goodnodes;
-}
+}  // namespace
 
 int main(int argc, char* argv[]) {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+
     if (argc < 10) {
         cerr << "Usage: " << argv[0]
              << " <target_file> <synth_file> <num_samples> <num_samples2>"
-             << " <mode> <mode2> <evbound> <degbound> <hdgbound>"
+             << " <mode> <mode2> <ignored_evb> <degbound_code> <hdgbound>"
              << " [completed_samples_file]\n";
         return 1;
     }
-	vector<vector<char>> bvv, bvvt;
-    vector<vector<int>> adj, adjt;
-    readGraph(argv[1], adjt, bvvt);
-    readGraph(argv[2], adj, bvv);
-	int num_samples = stoi(argv[3]);
-	int num_samples2 = stoi(argv[4]);
-	int m = stoi(argv[5]);
-	int m2 = stoi(argv[6]);
-	ld evbound = stod(argv[7]);
-	int degbound = stoi(argv[8]);
-	double degboundf = (double)degbound/140;
-	int hdgbound = stoi(argv[9]);
-	const string completed_samples_file =
-	    argc >= 11 ? argv[10] : "expfy_samples_done.tmp";
 
-	auto [evlt, evct] = evlevc(adjt);
-	auto [evl, evc] = evlevc(adj);
+    try {
+        const string target_file = argv[1];
+        const string synth_file = argv[2];
+        const int num_samples = parse_int(argv[3], "num_samples");
+        const int num_samples2 = parse_int(argv[4], "num_samples2");
+        const int mode1 = parse_int(argv[5], "mode");
+        const int mode2 = parse_int(argv[6], "mode2");
 
-	int n = adj.size();
-	vector<int> deg(n), degt(n);
-	for(int i=0; i<n; i++){
-		deg[i] = adj[i].size();
-		degt[i] = adjt[i].size();
-	}
+        // argv[7] intentionally remains in the interface so existing rpll.sh
+        // calls continue to work. The eigenvector system and evb constraint are
+        // completely removed; this text is neither parsed nor used.
+        (void)argv[7];
 
-	vector<int> gdnd = readGoodNodes(14);
-	//cerr << gdnd.size() << endl;
-	vector<ld> evcb = matchsortld(evct, evc);
-	vector<int> degb = matchsortint(degt, deg);
-
-    const SampleStats stats = sample_edge_prob(
-        adj, bvv, num_samples, num_samples2, m, m2, evcb, evlt,
-        evbound, degb, degboundf, gdnd, hdgbound);
-
-    ofstream completed_out(completed_samples_file);
-    if (!completed_out) {
-        cerr << "Error: cannot write completed sample counts to '"
-             << completed_samples_file << "'.\n";
-        return 1;
-    }
-    completed_out << stats.done1 << " " << stats.done2 << "\n";
-    completed_out.close();
-
-    // Connectivity repair is deliberately done after transformation sampling,
-    // so these bridge edges do not count as completed graphlet transformations.
-    reconnect_graph(adj, bvv);
-
-    for (size_t u = 0; u < adj.size(); u++) {
-        for (int v : adj[u]) {
-            if (u < static_cast<size_t>(v)) cout << u << " " << v << "\n";
+        const int degbound_code = parse_int(argv[8], "degbound_code");
+        const int hdgbound = parse_int(argv[9], "hdgbound");
+        if (degbound_code < 0 || hdgbound < 0) {
+            throw runtime_error("degbound_code and hdgbound must be nonnegative");
         }
+        const double degree_log_bound =
+            static_cast<double>(degbound_code) / 140.0;
+        const string completed_samples_file =
+            argc >= 11 ? argv[10] : "expfy_samples_done.tmp";
+
+        const EdgeListData target_data = read_edge_list(target_file);
+        const EdgeListData synth_data = read_edge_list(synth_file);
+        if (target_data.n != synth_data.n) {
+            throw runtime_error(
+                "target has " + to_string(target_data.n) +
+                " nodes but synthetic graph has " +
+                to_string(synth_data.n));
+        }
+
+        Graph graph(synth_data);
+        const vector<int> target_degree =
+            match_target_degrees_by_current_rank(
+                target_data.degree, graph.degree);
+        const vector<uint8_t> good_mask =
+            read_good_node_mask(graph.n);
+
+        const uint64_t seed = make_seed();
+        Sampler sampler(
+            graph,
+            target_degree,
+            degree_log_bound,
+            hdgbound,
+            good_mask,
+            seed);
+        const SampleStats stats =
+            sampler.run(num_samples, num_samples2, mode1, mode2);
+
+        ofstream completed_output(completed_samples_file);
+        if (!completed_output) {
+            throw runtime_error(
+                "cannot write completed sample counts to '" +
+                completed_samples_file + "'");
+        }
+        completed_output << stats.done1 << ' ' << stats.done2 << '\n';
+
+        // Preserve the current expfy behavior: connectivity is repaired only
+        // after sampling, and the bridge edges are not counted as transformations.
+        FastRng reconnect_rng(seed ^ 0xd1b54a32d192ed03ULL);
+        reconnect_graph(graph, reconnect_rng);
+
+        for (int u = 0; u < graph.n; ++u) {
+            for (int v : graph.adj[u]) {
+                if (u < v) cout << u << ' ' << v << '\n';
+            }
+        }
+    } catch (const exception& error) {
+        cerr << "Error: " << error.what() << '\n';
+        return 1;
     }
 
     return 0;

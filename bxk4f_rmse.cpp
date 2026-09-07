@@ -1,31 +1,40 @@
+// Batch replacement for bxk4f: one invocation evaluates every active pair.
+// This file is self-contained; the bxk4one programs may keep using their
+// existing rseas_metric_k45.hpp unchanged.
 #include <bits/stdc++.h>
 using namespace std;
-
-using Vec6 = array<double, 6>;
+using Vec = vector<double>;
 
 namespace {
 
-constexpr double EPS = 1e-12;
 constexpr double LOG_FLOOR = -15.0;
+
+double safe_log(double value) {
+    return value > 0.0 ? log(value) : LOG_FLOOR;
+}
+
+constexpr double EPS = 1e-12;
 
 struct Curve {
     double ka = 0.0;
     double kb = 0.0;
-    Vec6 A{};
-    Vec6 B{};
+    Vec A;
+    Vec B;
+
+    explicit Curve(size_t dimension) : A(dimension, 0.0), B(dimension, 0.0) {}
 };
 
-Vec6 lerp(const Vec6& p, const Vec6& q, double u) {
-    Vec6 result{};
-    for (int i = 0; i < 6; ++i) {
+Vec lerp(const Vec& p, const Vec& q, double u) {
+    Vec result(p.size(), 0.0);
+    for (size_t i = 0; i < p.size(); ++i) {
         result[i] = (1.0 - u) * p[i] + u * q[i];
     }
     return result;
 }
 
-Vec6 average(const Vec6& a, const Vec6& b) {
-    Vec6 result{};
-    for (int i = 0; i < 6; ++i) {
+Vec average(const Vec& a, const Vec& b) {
+    Vec result(a.size(), 0.0);
+    for (size_t i = 0; i < a.size(); ++i) {
         result[i] = 0.5 * (a[i] + b[i]);
     }
     return result;
@@ -50,8 +59,8 @@ Curve normalize_curve(Curve curve) {
     return curve;
 }
 
-Vec6 displacement(double x, const Curve& curve) {
-    const Vec6 zero{};
+Vec displacement(double x, const Curve& curve) {
+    const Vec zero(curve.A.size(), 0.0);
     if (x <= 0.0 || curve.kb <= 0.0) {
         return zero;
     }
@@ -77,6 +86,7 @@ void add_range(vector<double>& grid, double first, double last, double step) {
     if (step <= 0.0 || last < first) return;
     for (double x = first; x <= last + EPS; x += step) {
         grid.push_back(x);
+        if (x + step == x) throw runtime_error("grid scale is too large for its step");
     }
 }
 
@@ -114,25 +124,126 @@ vector<double> build_grid(const Curve& first, const Curve& second) {
     return grid;
 }
 
-// This deliberately matches the original rpll score convention for six unit
-// weights: sqrt(sum_i error_i^2).  Dividing by six would only multiply every
-// candidate score by the same constant and would not change the minimizer.
-double rmse_at(const Vec6& target,
-               const Vec6& initial,
-               double x,
-               double y,
-               const Curve& first,
-               const Curve& second) {
-    const Vec6 v1 = displacement(x, first);
-    const Vec6 v2 = displacement(y, second);
 
+double score_displacements(const Vec& target, const Vec& initial,
+                            const Vec& v1, const Vec& v2) {
     double sum = 0.0;
-    for (int i = 0; i < 6; ++i) {
+    for (size_t i = 0; i < target.size(); ++i) {
         const double predicted = initial[i] - v1[i] - v2[i];
         const double error = predicted - target[i];
         sum += error * error;
     }
     return sqrt(sum);
+}
+
+// All pair metadata and probe curves are read once for a round. Edge changes
+// come from rpll's ec table, so that table remains the single source of truth.
+struct Transformation {
+    int id = 0;
+    int edge_change = 0;
+    bool enabled = false;
+    Curve curve;
+    map<double, Vec> cached_displacements;
+
+    explicit Transformation(size_t dimension) : curve(dimension) {}
+};
+
+int read_integer(istream& input, const string& label) {
+    string token;
+    if (!(input >> token)) throw runtime_error("missing " + label);
+    try {
+        size_t used = 0;
+        int value = stoi(token, &used);
+        if (used == token.size()) return value;
+    } catch (const exception&) {}
+    throw runtime_error("invalid integer for " + label + ": '" + token + "'");
+}
+
+double read_number(istream& input, const string& label) {
+    double value = 0.0;
+    if (!(input >> value) || !isfinite(value)) {
+        throw runtime_error("expected a finite number for " + label);
+    }
+    return value;
+}
+
+void read_vector(istream& input, Vec& values, const string& label,
+                 bool frequencies = false) {
+    for (size_t i = 0; i < values.size(); ++i) {
+        values[i] = read_number(input, label + "[" + to_string(i) + "]");
+        if (frequencies && values[i] < 0.0) {
+            throw runtime_error(label + " contains a negative frequency");
+        }
+    }
+}
+
+vector<Transformation> read_batch(istream& input, Vec& initial, Vec& target) {
+    string magic;
+    if (!(input >> magic) || magic != "BXK4F_BATCH_V1") {
+        throw runtime_error("expected BXK4F_BATCH_V1; rebuild rpll and both "
+                            "bxk4f executables together for the batch interface");
+    }
+    const int count = read_integer(input, "transformation count");
+    if (count < 1 || count > 60) {
+        throw runtime_error("transformation count must be in [1,60]");
+    }
+    read_vector(input, initial, "current", true);
+    read_vector(input, target, "target", true);
+
+    array<bool, 61> seen{};
+    vector<Transformation> transformations;
+    transformations.reserve(static_cast<size_t>(count));
+    size_t active_count = 0;
+    for (int record = 0; record < count; ++record) {
+        Transformation t(initial.size());
+        t.id = read_integer(input, "transformation ID");
+        if (t.id < 1 || t.id > 60 || seen[t.id]) {
+            throw runtime_error("transformation IDs must be distinct and in [1,60]");
+        }
+        seen[t.id] = true;
+        t.edge_change = read_integer(input, "edge change for " + to_string(t.id));
+        const int enabled = read_integer(input, "enabled flag for " + to_string(t.id));
+        if (enabled != 0 && enabled != 1) {
+            throw runtime_error("enabled flag must be 0 or 1");
+        }
+        t.enabled = enabled == 1;
+        if (t.enabled) {
+            const string label = "transformation " + to_string(t.id);
+            t.curve.ka = read_number(input, label + " ka");
+            t.curve.kb = read_number(input, label + " kb");
+            read_vector(input, t.curve.A, label + " A");
+            read_vector(input, t.curve.B, label + " B");
+            t.curve = normalize_curve(move(t.curve));
+            // Guard overflow before using the original grid construction.
+            if (!isfinite(2.0 * t.curve.kb)) {
+                throw runtime_error(label + " has an excessively large scale");
+            }
+            ++active_count;
+        }
+        transformations.push_back(move(t));
+    }
+    input >> ws;
+    if (!input.eof()) throw runtime_error("extra data after the transformation table");
+    if (active_count == 0) throw runtime_error("no active transformations in batch");
+
+    for (size_t i = 0; i < initial.size(); ++i) {
+        initial[i] = safe_log(initial[i]);
+        target[i] = safe_log(target[i]);
+    }
+    // Preserve the old pair orientation: the larger transformation ID comes
+    // first. This matters for the asymmetric opposite-edge-change grid.
+    sort(transformations.begin(), transformations.end(),
+         [](const Transformation& a, const Transformation& b) {
+             return a.id < b.id;
+         });
+    return transformations;
+}
+
+const Vec& response_at(Transformation& t, double scale) {
+    auto found = t.cached_displacements.find(scale);
+    if (found != t.cached_displacements.end()) return found->second;
+    return t.cached_displacements.emplace(scale, displacement(scale, t.curve))
+        .first->second;
 }
 
 struct SearchResult {
@@ -141,106 +252,129 @@ struct SearchResult {
     double score = numeric_limits<double>::infinity();
 };
 
-SearchResult minimize_piece(const Vec6& target,
-                            const Vec6& initial,
-                            const Curve& first,
-                            const Curve& second,
-                            int edge_change1,
-                            int edge_change2) {
-    SearchResult best;
-    best.score = rmse_at(target, initial, 0.0, 0.0, first, second);
+template <typename Score>
+SearchResult minimize_pair(Transformation& first, Transformation& second,
+                           double baseline_score, const Score& score) {
+    SearchResult best{0.0, 0.0, baseline_score};
+    const int ec1 = first.edge_change;
+    const int ec2 = second.edge_change;
+    const bool both_zero = ec1 == 0 && ec2 == 0;
+    const bool opposite = (ec1 < 0 && ec2 > 0) || (ec1 > 0 && ec2 < 0);
 
-    const vector<double> grid = build_grid(first, second);
+    // Match the existing behavior: one-zero pairs and same-sign nonzero pairs
+    // return the baseline at (0,0), without inventing a new feasible search.
+    if (!both_zero && !opposite) return best;
 
-    if (edge_change1 == 0 && edge_change2 == 0) {
-        for (double x : grid) {
-            for (double y : grid) {
-                const double score =
-                    rmse_at(target, initial, x, y, first, second);
-                if (score < best.score) {
-                    best = {x, y, score};
+    const vector<double> grid = build_grid(first.curve, second.curve);
+    if (both_zero) {
+        vector<const Vec*> first_values, second_values;
+        first_values.reserve(grid.size());
+        second_values.reserve(grid.size());
+        for (double scale : grid) {
+            first_values.push_back(&response_at(first, scale));
+            second_values.push_back(&response_at(second, scale));
+        }
+        for (size_t i = 0; i < grid.size(); ++i) {
+            for (size_t j = 0; j < grid.size(); ++j) {
+                const double candidate = score(*first_values[i], *second_values[j]);
+                if (candidate < best.score) {
+                    best = {grid[i], grid[j], candidate};
                 }
             }
         }
-    } else if ((edge_change1 < 0 && edge_change2 > 0) ||
-               (edge_change1 > 0 && edge_change2 < 0)) {
+    } else {
         for (double x : grid) {
-            const double y = abs(
-                x * static_cast<double>(edge_change1) /
-                static_cast<double>(edge_change2));
-            const double score =
-                rmse_at(target, initial, x, y, first, second);
-            if (score < best.score) {
-                best = {x, y, score};
-            }
+            // Deliberately retain the original derived-y rule, including its
+            // original extrapolation range, rather than changing the search.
+            const double y = abs(x * static_cast<double>(ec1) /
+                                 static_cast<double>(ec2));
+            if (!isfinite(y)) throw runtime_error("derived pair scale overflow");
+            const double candidate = score(response_at(first, x), response_at(second, y));
+            if (candidate < best.score) best = {x, y, candidate};
         }
     }
-
-    // Preserve the intentional rule from the existing code: when exactly one
-    // edge change is zero, ignore the pair and return the no-change scales.
     return best;
 }
 
-bool read_vec6(istream& input, Vec6& values) {
-    for (double& value : values) {
-        if (!(input >> value)) return false;
-    }
-    return true;
+string scale_text(double scale) {
+    // Use the same rounding as the original fixed/setprecision(0) stdout.
+    // BAD_ZERO_SCALE must test what rpll would have read, not the unrounded x.
+    ostringstream output;
+    output << fixed << setprecision(0) << scale;
+    return output.str();
 }
 
-double safe_log(double value) {
-    return value > 0.0 ? log(value) : LOG_FLOOR;
+bool text_is_zero(const string& text) { return text == "0" || text == "-0"; }
+
+template <typename Score>
+void write_round_results(vector<Transformation>& transformations,
+                         double baseline_score, const Score& score) {
+    if (!isfinite(baseline_score)) throw runtime_error("nonfinite baseline score");
+    ostringstream output;
+    output << fixed << setprecision(17);
+    size_t pairs = 0, bad_pairs = 0, active_count = 0;
+    for (const auto& t : transformations) if (t.enabled) ++active_count;
+
+    for (size_t i = 0; i < transformations.size(); ++i) {
+        auto& first = transformations[i];
+        if (!first.enabled) continue;
+        for (size_t j = 0; j <= i; ++j) {
+            auto& second = transformations[j];
+            if (!second.enabled) continue;
+            const SearchResult best = minimize_pair(first, second, baseline_score, score);
+            const string x = scale_text(best.x);
+            const string y = scale_text(best.y);
+            ++pairs;
+            if (first.id != second.id && (text_is_zero(x) || text_is_zero(y))) {
+                ++bad_pairs;
+                output << "BAD_ZERO_SCALE|" << first.id << '|' << second.id
+                       << '|' << x << '|' << y << '|' << best.score << '\n';
+            } else {
+                output << best.score << '|' << first.id << '|' << second.id
+                       << '|' << x << '|' << y << '\n';
+            }
+        }
+    }
+    // No partial result table is published if parsing/scoring fails.
+    cout << output.str();
+    cout.flush();
+    if (!cout) throw runtime_error("failed to write round_results output");
+    cerr << "Batch bxk4f: " << active_count << " active transformations, "
+         << pairs << " pairs scored, " << bad_pairs << " mixed zero-scale pairs marked bad.\n";
+}
+
+int parse_k(const char* text) {
+    const string input(text);
+    size_t used = 0;
+    int k = stoi(input, &used);
+    if (used != input.size() || (k != 4 && k != 5)) {
+        throw runtime_error("k must be 4 or 5");
+    }
+    return k;
 }
 
 }  // namespace
 
 int main(int argc, char* argv[]) {
-    if (argc != 3) {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+    if (argc != 2) {
         cerr << "Usage: " << argv[0]
-             << " <edge_change_1> <edge_change_2>\n";
+             << " <k:4|5> < batch_input.txt > round_results.tmp\n";
         return 1;
     }
-
-    int edge_change1;
-    int edge_change2;
     try {
-        edge_change1 = stoi(argv[1]);
-        edge_change2 = stoi(argv[2]);
-    } catch (const exception&) {
-        cerr << "Error: invalid edge-change argument.\n";
+        const int k = parse_k(argv[1]);
+        const size_t dimension = k == 4 ? 6 : 21;
+        Vec initial(dimension), target(dimension), zero(dimension, 0.0);
+        auto transformations = read_batch(cin, initial, target);
+        const auto score = [&](const Vec& a, const Vec& b) {
+            return score_displacements(target, initial, a, b);
+        };
+        write_round_results(transformations, score(zero, zero), score);
+    } catch (const exception& error) {
+        cerr << "bxk4f RMSE: " << error.what() << '\n';
         return 1;
     }
-
-    Vec6 initial{};
-    Vec6 target{};
-    Curve first;
-    Curve second;
-
-    // Input layout, produced by rpll_rseas_then_rmse.sh:
-    //   initial[6], target[6]
-    //   first.ka first.kb, first.A[6], first.B[6]
-    //   second.ka second.kb, second.A[6], second.B[6]
-    if (!read_vec6(cin, initial) || !read_vec6(cin, target) ||
-        !(cin >> first.ka >> first.kb) ||
-        !read_vec6(cin, first.A) || !read_vec6(cin, first.B) ||
-        !(cin >> second.ka >> second.kb) ||
-        !read_vec6(cin, second.A) || !read_vec6(cin, second.B)) {
-        cerr << "Error: incomplete bxk4f RMSE input.\n";
-        return 1;
-    }
-
-    for (int i = 0; i < 6; ++i) {
-        initial[i] = safe_log(initial[i]);
-        target[i] = safe_log(target[i]);
-    }
-
-    first = normalize_curve(first);
-    second = normalize_curve(second);
-
-    const SearchResult best = minimize_piece(
-        target, initial, first, second, edge_change1, edge_change2);
-
-    cout << fixed << setprecision(0) << best.x << ' ' << best.y << ' ';
-    cout << setprecision(17) << best.score << '\n';
     return 0;
 }

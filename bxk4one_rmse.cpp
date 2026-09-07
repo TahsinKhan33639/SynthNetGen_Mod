@@ -1,32 +1,44 @@
 #include <bits/stdc++.h>
+#include "rseas_metric_k45.hpp"
 using namespace std;
 
-using Vec6 = array<double, 6>;
+using Vec = rseas_metric::Vec;
 
 namespace {
 
 constexpr double EPS = 1e-15;
-constexpr double LOG_FLOOR = -15.0;
 
-double safe_log(double value) {
-    return value > 0.0 ? log(value) : LOG_FLOOR;
-}
-
-bool read_vec6(istream& input, Vec6& values) {
+bool read_vec(istream& input, Vec& values) {
     for (double& value : values) {
         if (!(input >> value)) return false;
     }
     return true;
 }
 
-double find_best_multiplier(const Vec6& current,
-                            const Vec6& target,
-                            const Vec6& displacement) {
+bool no_extra_values(istream& input) {
+    input >> ws;
+    return input.eof();
+}
+
+bool parse_k(const char* text, int& k) {
+    try {
+        size_t used = 0;
+        const string input(text);
+        k = stoi(input, &used);
+        return used == input.size() && (k == 4 || k == 5);
+    } catch (const exception&) {
+        return false;
+    }
+}
+
+double find_best_multiplier(const Vec& current,
+                            const Vec& target,
+                            const Vec& displacement) {
     double numerator = 0.0;
     double denominator = 0.0;
 
     // Minimize sum_i (current_i + u*displacement_i - target_i)^2.
-    for (int i = 0; i < 6; ++i) {
+    for (size_t i = 0; i < current.size(); ++i) {
         numerator += displacement[i] * (target[i] - current[i]);
         denominator += displacement[i] * displacement[i];
     }
@@ -41,27 +53,37 @@ double find_best_multiplier(const Vec6& current,
 }  // namespace
 
 int main(int argc, char* argv[]) {
-    if (argc != 1) {
-        cerr << "Usage: " << argv[0] << " < scale_input\n";
+    if (argc != 2) {
+        cerr << "Usage: " << argv[0] << " <k:4|5> < scale_input\n";
         return 1;
     }
 
-    Vec6 current{};
-    Vec6 target{};
-    Vec6 displacement{};
-
-    if (!read_vec6(cin, current) ||
-        !read_vec6(cin, target) ||
-        !read_vec6(cin, displacement)) {
-        cerr << "Error: incomplete bxk4one RMSE input.\n";
+    int k = 0;
+    if (!parse_k(argv[1], k)) {
+        cerr << "Error: k must be 4 or 5.\n";
         return 1;
     }
 
-    for (int i = 0; i < 6; ++i) {
-        current[i] = safe_log(current[i]);
-        target[i] = safe_log(target[i]);
+    const size_t dimension = rseas_metric::dimension_for_k(k);
+    Vec current(dimension, 0.0);
+    Vec target(dimension, 0.0);
+    Vec displacement(dimension, 0.0);
 
-        // rpll writes log(current)-log(stage1).  Negating it gives the observed
+    if (!read_vec(cin, current) ||
+        !read_vec(cin, target) ||
+        !read_vec(cin, displacement) ||
+        !no_extra_values(cin)) {
+        cerr << "Error: bxk4one RMSE expected exactly "
+             << (3 * dimension) << " numeric input values for k="
+             << k << ".\n";
+        return 1;
+    }
+
+    for (size_t i = 0; i < dimension; ++i) {
+        current[i] = rseas_metric::safe_log(current[i]);
+        target[i] = rseas_metric::safe_log(target[i]);
+
+        // rpll writes log(current)-log(stage1). Negating it gives the observed
         // movement from the current graph toward the stage-one graph.
         displacement[i] = -displacement[i];
     }
@@ -72,3 +94,4 @@ int main(int argc, char* argv[]) {
     cout << fixed << setprecision(12) << u << '\n';
     return 0;
 }
+
