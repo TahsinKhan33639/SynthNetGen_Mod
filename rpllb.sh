@@ -27,7 +27,85 @@ rm -rf baseline .generate_outinp_* .run_round.*
 set -e
 
 # Set graphlet frequency checker
-g++ -O2 onb.cpp -o bnb
+g++ -O2 bnb.cpp -o bnb
+
+# Launch from the project directory containing bnb, blant, canon_maps, and
+# orca_jesse_blant_table. Candidate work directories must not become BLANT's cwd.
+RPLLB_ROOT_DIR=$(pwd -P)
+
+# Dense-graph setup: compute node orbits once on the initial synthetic graph.
+# Keep this data_middle1.txt unchanged for all later selection and filtering.
+# Use a headered temporary copy rather than modifying the input graph.
+initialize_node_weights() (
+    set -e
+    local GRAPH_ABS="$1"
+    local ORCA_INPUT ORCA_OUTPUT ORBIT_NODE_COUNT
+    ORCA_INPUT=$(mktemp .rpllb_orca_input.XXXXXX) || exit 1
+    ORCA_OUTPUT=""
+    trap 'rm -f -- "$ORCA_INPUT" ${ORCA_OUTPUT:+"$ORCA_OUTPUT"}' EXIT
+    ORCA_OUTPUT=$(mktemp .rpllb_orca_output.XXXXXX) || exit 1
+
+    ORBIT_NODE_COUNT=$(python3 - "$GRAPH_ABS" "$ORCA_INPUT" << 'EOF_ORCA_INPUT'
+import sys
+
+source, destination = sys.argv[1:]
+edges = set()
+with open(source, encoding="utf-8") as graph:
+    for line in graph:
+        if not line.strip():
+            continue
+        u, v = map(int, line.split())
+        if u < 0 or v < 0:
+            raise SystemExit("ORCA input must have nonnegative vertex IDs")
+        if u != v:
+            edges.add((min(u, v), max(u, v)))
+if not edges:
+    raise SystemExit("ORCA input graph has no edges")
+n = max(max(edge) for edge in edges) + 1
+with open(destination, "w", encoding="utf-8") as graph:
+    graph.write(f"{n} {len(edges)}\n")
+    for u, v in sorted(edges):
+        graph.write(f"{u} {v}\n")
+print(n)
+EOF_ORCA_INPUT
+    ) || exit 1
+
+    "$RPLLB_ROOT_DIR/orca" 4 "$ORCA_INPUT" "$ORCA_OUTPUT" > smth.txt || exit 1
+    # Some ORCA failures return zero: reject empty, partial or malformed output.
+    if ! awk -v N="$ORBIT_NODE_COUNT" '
+        NF != 15 { bad = 1 }
+        { for (i = 1; i <= NF; ++i) if ($i !~ /^[0-9]+$/) bad = 1 }
+        END { exit (bad || NR != N) }
+    ' "$ORCA_OUTPUT"; then
+        echo "ORCA did not produce $ORBIT_NODE_COUNT complete 15-column rows for $GRAPH_ABS." >&2
+        exit 1
+    fi
+    mv -- "$ORCA_OUTPUT" "$RPLLB_ROOT_DIR/data_middle1.txt" || exit 1
+)
+
+run_bnb() {
+    local K="$1"
+    local GRAPH_ABS GRAPH_QUOTED
+    GRAPH_ABS=$(realpath -- "$2") || return 1
+    # bnb.cpp embeds argv[2] in a /bin/sh command. Pass a POSIX-quoted path
+    # so spaces, apostrophes and shell metacharacters retain their literal meaning.
+    GRAPH_QUOTED="'${GRAPH_ABS//\'/\'\\\'\'}'"
+    (
+        cd -- "$RPLLB_ROOT_DIR" || exit 1
+        ./bnb "$K" "$GRAPH_QUOTED"
+    ) || return 1
+}
+
+run_expfy() {
+    # Measure the current graph with BLANT while retaining the initial ORCA
+    # weights. Candidate directories receive a copy in prepare_serial_worker.
+    run_bnb 4 "$2" > bres.tmp || return 1
+    if [ ! -r data_middle1.txt ]; then
+        echo "Initial node-selection weights are missing: data_middle1.txt." >&2
+        return 1
+    fi
+    "$EXPFY_BIN" "$@"
+}
 
 # Node-dependent work is calibrated to a 1,000-node graph.  EFFECTIVE_N is
 # clamped so small graphs still get enough trials for stable estimates while
@@ -519,28 +597,15 @@ build_round_constraint_schedule
 
 if (( ! INITIAL_GRAPH_GIVEN )); then
     ./gen_deg2 "$TARGET" synth_base_1.txt
+    initialize_node_weights synth_base_1.txt || exit 1
 
-    ./bnb 4 synth_base_1.txt > bres.tmp
-    cat data_middle.txt > data_middle1.txt
-    "$EXPFY_BIN" "$TARGET" synth_base_1.txt "$INIT_PRIMARY_SAMPLES" "$INIT_PRIMARY_SAMPLES" 1 8 2.0 20 "$INIT_HDGB_1" > synth_base_2.txt
-    ./bnb 4 synth_base_2.txt > bres.tmp
-    cat data_middle.txt > data_middle1.txt
-    "$EXPFY_BIN" "$TARGET" synth_base_2.txt "$INIT_MAIN_SAMPLES" "$INIT_MAIN_SAMPLES" 1 8 1.7 18 "$INIT_HDGB_2" > synth_base_3.txt
-    ./bnb 4 synth_base_3.txt > bres.tmp
-    cat data_middle.txt > data_middle1.txt
-    "$EXPFY_BIN" "$TARGET" synth_base_3.txt "$INIT_MAIN_SAMPLES" "$INIT_MAIN_SAMPLES" 1 8 1.5 18 "$INIT_HDGB_3" > synth_base_4.txt
-    ./bnb 4 synth_base_4.txt > bres.tmp
-    cat data_middle.txt > data_middle1.txt
-    "$EXPFY_BIN" "$TARGET" synth_base_4.txt "$INIT_MAIN_SAMPLES" "$INIT_MAIN_SAMPLES" 1 8 1.3 17 "$INIT_HDGB_4" > synth_base_5.txt
-    ./bnb 4 synth_base_5.txt > bres.tmp
-    cat data_middle.txt > data_middle1.txt
-    "$EXPFY_BIN" "$TARGET" synth_base_5.txt "$INIT_MAIN_SAMPLES" "$INIT_SECONDARY_SAMPLES" 1 17 1.2 16 "$INIT_HDGB_5" > synth_base_6.txt
-    ./bnb 4 synth_base_6.txt > bres.tmp
-    cat data_middle.txt > data_middle1.txt
-    "$EXPFY_BIN" "$TARGET" synth_base_6.txt "$INIT_MAIN_SAMPLES" "$INIT_SECONDARY_SAMPLES" 1 17 1.1 15 "$INIT_HDGB_6" > synth_base_7.txt
-    ./bnb 4 synth_base_7.txt > bres.tmp
-    cat data_middle.txt > data_middle1.txt
-    "$EXPFY_BIN" "$TARGET" synth_base_7.txt "$INIT_MAIN_SAMPLES" "$INIT_SECONDARY_SAMPLES" 1 17 1 14 "$INIT_HDGB_7" > synth_base_8.txt
+    run_expfy "$TARGET" synth_base_1.txt "$INIT_PRIMARY_SAMPLES" "$INIT_PRIMARY_SAMPLES" 1 8 2.0 20 "$INIT_HDGB_1" > synth_base_2.txt
+    run_expfy "$TARGET" synth_base_2.txt "$INIT_MAIN_SAMPLES" "$INIT_MAIN_SAMPLES" 1 8 1.7 18 "$INIT_HDGB_2" > synth_base_3.txt
+    run_expfy "$TARGET" synth_base_3.txt "$INIT_MAIN_SAMPLES" "$INIT_MAIN_SAMPLES" 1 8 1.5 18 "$INIT_HDGB_3" > synth_base_4.txt
+    run_expfy "$TARGET" synth_base_4.txt "$INIT_MAIN_SAMPLES" "$INIT_MAIN_SAMPLES" 1 8 1.3 17 "$INIT_HDGB_4" > synth_base_5.txt
+    run_expfy "$TARGET" synth_base_5.txt "$INIT_MAIN_SAMPLES" "$INIT_SECONDARY_SAMPLES" 1 17 1.2 16 "$INIT_HDGB_5" > synth_base_6.txt
+    run_expfy "$TARGET" synth_base_6.txt "$INIT_MAIN_SAMPLES" "$INIT_SECONDARY_SAMPLES" 1 17 1.1 15 "$INIT_HDGB_6" > synth_base_7.txt
+    run_expfy "$TARGET" synth_base_7.txt "$INIT_MAIN_SAMPLES" "$INIT_SECONDARY_SAMPLES" 1 17 1 14 "$INIT_HDGB_7" > synth_base_8.txt
 
     PRE_INIT_SYNTH=synth_base_8.txt
 else
@@ -552,6 +617,7 @@ else
         echo "Target has $NODE_COUNT nodes but base synth has $SYNTH_NODE_COUNT; expfy requires equal node counts." >&2
         exit 1
     fi
+    initialize_node_weights "$PRE_INIT_SYNTH" || exit 1
 fi
 
 # PIS uses one target vector, unit weights, and one error range fixed from the
@@ -571,7 +637,7 @@ pis_graph_rseas() {
 
     VEC_FILE=$(mktemp ".pis_vec.XXXXXX")
     DISPL_FILE=$(mktemp ".pis_displ.XXXXXX")
-    if ! ./bnb "$GRAPHLET_K" "$GRAPH" > "$VEC_FILE"; then
+    if ! run_bnb "$GRAPHLET_K" "$GRAPH" > "$VEC_FILE"; then
         rm -f "$VEC_FILE" "$DISPL_FILE"
         return 1
     fi
@@ -666,8 +732,8 @@ make_pis_increase_candidate() {
 local_pis_initial_vec=$(mktemp ".pis_initial_vec.XXXXXX")
 local_pis_initial_displ=$(mktemp ".pis_initial_displ.XXXXXX")
 
-./bnb "$GRAPHLET_K" "$TARGET" > "$PIS_TARGET_VEC"
-./bnb "$GRAPHLET_K" "$PRE_INIT_SYNTH" > "$local_pis_initial_vec"
+run_bnb "$GRAPHLET_K" "$TARGET" > "$PIS_TARGET_VEC"
+run_bnb "$GRAPHLET_K" "$PRE_INIT_SYNTH" > "$local_pis_initial_vec"
 
 read -r PIS_WORST_INDEX PIS_WORST_GRAPHLET PIS_MAX_ERROR PIS_RSEAS_E \
     < <(log_error_summary "$local_pis_initial_vec" "$PIS_TARGET_VEC")
@@ -799,13 +865,7 @@ column_graphlet=(0 0 0 0 6 6 5 5 8 7 7 7 9 9 10)
 declare -a graphlet_node_count
 declare -a rare_graphlet
 
-# Number of simultaneous workers used by generate_outinp.
-# Override when launching, for example: PARALLEL_JOBS=4 ./rpll_parallel_round.sh ...
-PARALLEL_JOBS="${PARALLEL_JOBS:-2}"
-
-# Number of simultaneous workers used inside run_round.  By default it uses
-# the same limit as generate_outinp, but it can be tuned independently.
-ROUND_JOBS="${ROUND_JOBS:-$PARALLEL_JOBS}"
+# Transformation probes and round candidates are evaluated sequentially.
 
 declare -a ec
 for ((i=1; i<=MAX_TRANSFORMATION; i++)); do
@@ -862,25 +922,23 @@ ec[72]=0;   # Exchange two edges between a triangle and a branch.
 BASELINE_DIR="baseline"
 mkdir -p "$BASELINE_DIR"
 
-# Create an isolated current directory for a parallel worker.  Several of the
-# project executables create fixed-name scratch files such as data_middle.txt,
-# so merely changing the shell output filename is not enough to prevent races.
-prepare_parallel_worker() {
+# Keep candidate scratch files in private directories even though work is serial.
+# BLANT-backed bnb calls are routed to the launch directory by run_bnb.
+prepare_serial_worker() {
     local WORK_DIR="$1"
     local ROOT_DIR="$2"
     local SHARED_FILE TOOL
 
     mkdir -p "$WORK_DIR"
 
-    for SHARED_FILE in data_middle.txt data_middle1.txt f0.txt; do
+    for SHARED_FILE in data_middle1.txt f0.txt; do
         if [ -f "$ROOT_DIR/$SHARED_FILE" ]; then
             cp "$ROOT_DIR/$SHARED_FILE" "$WORK_DIR/$SHARED_FILE"
         fi
     done
 
-    # bnb and expfy may invoke other executables through paths such as ./blant.
-    # Linking every project executable keeps those calls working inside the
-    # private directory without sharing their generated scratch files.
+    # Other tools can still use project-local executables in this directory.
+    # run_bnb explicitly returns to RPLLB_ROOT_DIR for BLANT and its resources.
     for TOOL in "$ROOT_DIR"/*; do
         if [ ! -f "$TOOL" ]; then
             continue
@@ -1221,7 +1279,7 @@ apply_exp() {
     REQUESTED_SAMPLES=$(scale_apply_samples "$REQUESTED_SCALE" "$DIVISOR")
 
     SAMPLE_FILE=$(mktemp ".expfy_samples.XXXXXX.tmp")
-    if ! "$EXPFY_BIN" "$TARGET" "$INPUT_FILE" "$REQUESTED_SAMPLES" 0 \
+    if ! run_expfy "$TARGET" "$INPUT_FILE" "$REQUESTED_SAMPLES" 0 \
         "$VAL" 1 "$evb" "$degb" "$hdgb" "$SAMPLE_FILE" \
         > "$OUTPUT_FILE"; then
         rm -f "$SAMPLE_FILE" "$OUTPUT_FILE"
@@ -1268,7 +1326,7 @@ apply_exp2() {
     REQUESTED_SAMPLES2=$(scale_apply_samples "$REQUESTED_SCALE2" "$DIVISOR2")
 
     SAMPLE_FILE=$(mktemp ".expfy_samples.XXXXXX.tmp")
-    if ! "$EXPFY_BIN" "$TARGET" "$INPUT_FILE" \
+    if ! run_expfy "$TARGET" "$INPUT_FILE" \
         "$REQUESTED_SAMPLES1" "$REQUESTED_SAMPLES2" "$VAL" "$VAL2" \
         "$evb" "$degb" "$hdgb" "$SAMPLE_FILE" > "$OUTPUT_FILE"; then
         rm -f "$SAMPLE_FILE" "$OUTPUT_FILE"
@@ -1313,20 +1371,14 @@ run_round() {
         local ROOT_DIR
         ROOT_DIR=$(pwd -P)
 
-        local MAX_JOBS="$ROUND_JOBS"
-        if ! is_positive_integer "$MAX_JOBS"; then
-            echo "ROUND_JOBS must be a positive integer, not '$MAX_JOBS'." >&2
-            exit 1
-        fi
 
         local INPUT_ABS OUTPUT_ABS TARGET_ABS VEC_TAR_ABS F0_ABS
-        local BNB_ABS EVS_ABS BXK4F_ABS BXK4ONE_ABS
+        local EVS_ABS BXK4F_ABS BXK4ONE_ABS
         INPUT_ABS=$(realpath "$INPUT_SYNTH")
         OUTPUT_ABS=$(realpath -m "$OUTPUT_SYNTH")
         TARGET_ABS=$(realpath "$TARGET")
         VEC_TAR_ABS=$(realpath vecTar.txt)
         F0_ABS=$(realpath f0.txt)
-        BNB_ABS=$(realpath ./bnb)
         EVS_ABS=$(realpath ./evs)
         if [ "$ROUND_OBJECTIVE" = "RSEAS" ]; then
             BXK4F_ABS=$(realpath ./bxk4f_rseas)
@@ -1344,9 +1396,7 @@ run_round() {
         local INPL="$ROOT_DIR/inpl.txt"
         local INP="$ROOT_DIR/inp.txt"
 
-        "$BNB_ABS" "$GRAPHLET_K" "$INPUT_ABS" > "$VEC_INS"
-        "$BNB_ABS" 4 "$INPUT_ABS" > "$ROOT_DIR/bres.tmp"
-        cp "$ROOT_DIR/data_middle.txt" "$ROOT_DIR/data_middle1.txt"
+        run_bnb "$GRAPHLET_K" "$INPUT_ABS" > "$VEC_INS"
 
         displ "$VEC_INS" "$VEC_TAR_ABS" "$INPL"
         cat "$VEC_INS" "$VEC_TAR_ABS" > "$INP"
@@ -1355,10 +1405,10 @@ run_round() {
         had_score=$(objective_score "$F0_ABS" "$INPL")
 
         echo "New $ROUND_OBJECTIVE round with input $INPUT_SYNTH"
-        echo "Running independent round work with up to $MAX_JOBS parallel jobs"
+        echo "Evaluating round candidates sequentially"
 
         # ---------------------------------------------------------
-        # 1. Generate and evaluate six EVC candidates in parallel: small and
+        # 1. Generate and evaluate six EVC candidates sequentially: small and
         #    large runs of evc1, evc2, and the union/intersection evc3.
         # ---------------------------------------------------------
         local EVC_DIR="$ROUND_DIR/evc"
@@ -1402,9 +1452,7 @@ run_round() {
             "$OUTPEV_SMALL_SAMPLES" "$OUTPEV_LARGE_SAMPLES"
             "$OUTPEV_SMALL_SAMPLES" "$OUTPEV_LARGE_SAMPLES"
         )
-        local -a EVC_PIDS=()
-        local EVC_FAILED=0
-        local IDX LABEL TOOL AMOUNT PID
+        local IDX LABEL TOOL AMOUNT
 
         for IDX in "${!EVC_LABELS[@]}"; do
             LABEL="${EVC_LABELS[$IDX]}"
@@ -1414,7 +1462,7 @@ run_round() {
             (
                 set -e
                 local WORK_DIR="$EVC_DIR/work_$LABEL"
-                prepare_parallel_worker "$WORK_DIR" "$ROOT_DIR"
+                prepare_serial_worker "$WORK_DIR" "$ROOT_DIR"
                 trap 'rm -rf -- "$WORK_DIR"' EXIT
                 cd "$WORK_DIR"
 
@@ -1447,7 +1495,7 @@ run_round() {
                     exit 1
                 fi
 
-                ./bnb "$GRAPHLET_K" candidate.graph > candidate.vec
+                run_bnb "$GRAPHLET_K" candidate.graph > candidate.vec
                 displ "$VEC_INS" candidate.vec candidate.displ
 
                 local SCORE
@@ -1459,27 +1507,8 @@ run_round() {
                     "$AFTER_EV_DISTANCE" "$GATE_REASON" \
                     > "$EVC_DIR/$LABEL.result.tmp"
                 mv "$EVC_DIR/$LABEL.result.tmp" "$EVC_DIR/$LABEL.result"
-            ) &
-            EVC_PIDS+=("$!")
-
-            if (( ${#EVC_PIDS[@]} >= MAX_JOBS )); then
-                if ! wait "${EVC_PIDS[0]}"; then
-                    EVC_FAILED=1
-                fi
-                EVC_PIDS=("${EVC_PIDS[@]:1}")
-            fi
+            )
         done
-
-        for PID in "${EVC_PIDS[@]}"; do
-            if ! wait "$PID"; then
-                EVC_FAILED=1
-            fi
-        done
-
-        if (( EVC_FAILED )); then
-            echo "At least one parallel EVC evaluation failed." >&2
-            exit 1
-        fi
 
         local BEST_EVC_GRAPH="$INPUT_ABS"
         local BEST_EVC_SCORE="$had_score"
@@ -1518,9 +1547,7 @@ run_round() {
         fi
 
         # Recompute the current graph vector after the possible EVC replacement.
-        "$BNB_ABS" "$GRAPHLET_K" "$INPUT_ABS" > "$VEC_INS"
-        "$BNB_ABS" 4 "$INPUT_ABS" > "$ROOT_DIR/bres.tmp"
-        cp "$ROOT_DIR/data_middle.txt" "$ROOT_DIR/data_middle1.txt"
+        run_bnb "$GRAPHLET_K" "$INPUT_ABS" > "$VEC_INS"
         displ "$VEC_INS" "$VEC_TAR_ABS" "$INPL"
         cat "$VEC_INS" "$VEC_TAR_ABS" > "$INP"
 
@@ -1589,7 +1616,7 @@ run_round() {
         fi
 
         # ---------------------------------------------------------
-        # 3. Evaluate the ten most promising nonredundant pairs in parallel.
+        # 3. Evaluate the ten most promising nonredundant pairs sequentially.
         # ---------------------------------------------------------
         local TOP_DIR="$ROUND_DIR/top"
         mkdir -p "$TOP_DIR"
@@ -1606,8 +1633,6 @@ run_round() {
             exit 1
         fi
 
-        local -a TOP_PIDS=()
-        local TOP_FAILED=0
         local RANK LINE
         local sorted_score sorted_VAL sorted_VAL2 sorted_MAG sorted_MAG2
         local SCALE SCALE2
@@ -1632,11 +1657,11 @@ run_round() {
             (
                 set -e
                 local WORK_DIR="$TOP_DIR/work_$RANK"
-                prepare_parallel_worker "$WORK_DIR" "$ROOT_DIR"
+                prepare_serial_worker "$WORK_DIR" "$ROOT_DIR"
                 trap 'rm -rf -- "$WORK_DIR"' EXIT
                 cd "$WORK_DIR"
 
-                # apply_exp2 refers to TARGET dynamically and invokes the selected backend.
+                # apply_exp2 refers to TARGET dynamically and invokes run_expfy.
                 local TARGET="$TARGET_ABS"
                 local STAGE1="candidate_stage1.graph"
                 local FINAL_CANDIDATE="candidate_final.graph"
@@ -1650,7 +1675,7 @@ run_round() {
                     "$sorted_VAL" "$sorted_VAL2" "$STAGE1" \
                     STAGE1_TESTED_SCALE STAGE1_TESTED_SCALE2
 
-                ./bnb "$GRAPHLET_K" "$STAGE1" > stage1.vec
+                run_bnb "$GRAPHLET_K" "$STAGE1" > stage1.vec
                 displ "$VEC_INS" stage1.vec stage1.displ
                 cat "$INP" stage1.displ > scale_input.tmp
                 if [ "$ROUND_OBJECTIVE" = "RSEAS" ]; then
@@ -1674,7 +1699,7 @@ run_round() {
                     "$sorted_VAL" "$sorted_VAL2" "$FINAL_CANDIDATE" \
                     FINAL_TESTED_SCALE FINAL_TESTED_SCALE2
 
-                ./bnb "$GRAPHLET_K" "$FINAL_CANDIDATE" > final.vec
+                run_bnb "$GRAPHLET_K" "$FINAL_CANDIDATE" > final.vec
                 displ "$VEC_INS" final.vec final.displ
                 GOT_SCORE=$(objective_score final.displ "$INPL")
 
@@ -1695,27 +1720,8 @@ run_round() {
                     > "$TOP_DIR/result_$(printf '%02d' "$RANK").tmp"
                 mv "$TOP_DIR/result_$(printf '%02d' "$RANK").tmp" \
                    "$TOP_DIR/result_$(printf '%02d' "$RANK").txt"
-            ) &
-            TOP_PIDS+=("$!")
-
-            if (( ${#TOP_PIDS[@]} >= MAX_JOBS )); then
-                if ! wait "${TOP_PIDS[0]}"; then
-                    TOP_FAILED=1
-                fi
-                TOP_PIDS=("${TOP_PIDS[@]:1}")
-            fi
+            )
         done
-
-        for PID in "${TOP_PIDS[@]}"; do
-            if ! wait "$PID"; then
-                TOP_FAILED=1
-            fi
-        done
-
-        if (( TOP_FAILED )); then
-            echo "At least one parallel top-pair evaluation failed." >&2
-            exit 1
-        fi
 
         local BEST_VAL=""
         local BEST_VAL2=""
@@ -1794,17 +1800,9 @@ run_round() {
                 PROBE_GRAPH="$REFINE_DIR/probe_${REFINE_ITER}.graph"
                 REFINED_CANDIDATE="$REFINE_DIR/refined_candidate_${REFINE_ITER}.graph"
 
-                # The probe and final application must use node-selection data
-                # from the graph being refined. For k=5, this deliberately means
-                # one bnb 5 call for the objective vector and one bnb 4 call for
-                # data_middle1.txt.
-                "$BNB_ABS" "$GRAPHLET_K" "$REFINE_GRAPH" > "$CURRENT_VEC"
-                if (( GRAPHLET_K == 4 )); then
-                    cp "$ROOT_DIR/data_middle.txt" "$ROOT_DIR/data_middle1.txt"
-                else
-                    "$BNB_ABS" 4 "$REFINE_GRAPH" > "$REFINE_DIR/bres_${REFINE_ITER}.tmp"
-                    cp "$ROOT_DIR/data_middle.txt" "$ROOT_DIR/data_middle1.txt"
-                fi
+                # Refresh the objective vector; node-selection weights remain
+                # those of the initial synthetic graph, including in k=5 runs.
+                run_bnb "$GRAPHLET_K" "$REFINE_GRAPH" > "$CURRENT_VEC"
 
                 # Probe by applying the same pair once more at its latest
                 # accepted effective scales.
@@ -1812,7 +1810,7 @@ run_round() {
                     "$BEST_VAL" "$BEST_VAL2" "$PROBE_GRAPH" \
                     PROBE_TESTED_SCALE PROBE_TESTED_SCALE2
 
-                "$BNB_ABS" "$GRAPHLET_K" "$PROBE_GRAPH" > "$PROBE_VEC"
+                run_bnb "$GRAPHLET_K" "$PROBE_GRAPH" > "$PROBE_VEC"
                 displ "$CURRENT_VEC" "$PROBE_VEC" "$PROBE_DISPL"
                 cat "$CURRENT_VEC" "$VEC_TAR_ABS" "$PROBE_DISPL" > "$SCALE_INPUT"
 
@@ -1843,7 +1841,7 @@ run_round() {
                     "$BEST_VAL" "$BEST_VAL2" "$REFINED_CANDIDATE" \
                     CANDIDATE_TESTED_SCALE CANDIDATE_TESTED_SCALE2
 
-                "$BNB_ABS" "$GRAPHLET_K" "$REFINED_CANDIDATE" > "$CANDIDATE_VEC"
+                run_bnb "$GRAPHLET_K" "$REFINED_CANDIDATE" > "$CANDIDATE_VEC"
                 displ "$CANDIDATE_VEC" "$VEC_TAR_ABS" "$CANDIDATE_TARGET_DISPL"
                 CANDIDATE_SCORE=$(objective_score "$F0_ABS" "$CANDIDATE_TARGET_DISPL")
 
@@ -1867,7 +1865,7 @@ run_round() {
         fi
 
         echo "Achieved graphlet frequency:"
-        "$BNB_ABS" "$GRAPHLET_K" "$OUTPUT_ABS"
+        run_bnb "$GRAPHLET_K" "$OUTPUT_ABS"
     )
 }
 
@@ -1876,24 +1874,16 @@ generate_outinp() {
         local ROOT_DIR
         ROOT_DIR=$(pwd -P)
 
-        local INS_ABS TARGET_ABS VEC_INS_ABS BNB_ABS
+        local INS_ABS TARGET_ABS VEC_INS_ABS
         INS_ABS=$(realpath "$InS")
         TARGET_ABS=$(realpath "$TARGET")
         VEC_INS_ABS=$(realpath vecInS.txt)
-        BNB_ABS=$(realpath ./bnb)
 
-        local MAX_JOBS="$PARALLEL_JOBS"
-        if ! [[ "$MAX_JOBS" =~ ^[1-9][0-9]*$ ]]; then
-                echo "PARALLEL_JOBS must be a positive integer, not '$MAX_JOBS'." >&2
-                return 1
-        fi
 
         echo
-        echo "Re-getting transformation results with $MAX_JOBS parallel jobs"
+        echo "Re-getting transformation results sequentially"
         echo
 
-        local -a PIDS=()
-        local FAILED=0
         local VAL
 
         for VAL in "${ACTIVE_CANDS[@]}"; do
@@ -1904,25 +1894,7 @@ generate_outinp() {
                         WORK_DIR=$(mktemp -d "$ROOT_DIR/.generate_outinp_${VAL}.XXXXXX")
                         trap 'rm -rf -- "$WORK_DIR"' EXIT
 
-                        # expfy/bnb use files in the current directory.  Each candidate gets
-                        # a private directory so their temporary files cannot overwrite one another.
-                        for SHARED_FILE in data_middle.txt data_middle1.txt; do
-                                if [ -f "$ROOT_DIR/$SHARED_FILE" ]; then
-                                        cp "$ROOT_DIR/$SHARED_FILE" "$WORK_DIR/$SHARED_FILE"
-                                fi
-                        done
-
-                        # Also expose every executable from the project directory.  This covers
-                        # wrappers such as bnb that may launch another local executable (for
-                        # example ./blant) while keeping their generated data files job-local.
-                        for TOOL in "$ROOT_DIR"/*; do
-                                if [ -f "$TOOL" ] && [ -x "$TOOL" ]; then
-                                        ln -s "$TOOL" "$WORK_DIR/${TOOL##*/}"
-                                fi
-                        done
-
-                        # The transformation backend uses its absolute EXPFY_BIN path.
-                        [ -e "$WORK_DIR/bnb" ] || ln -s "$BNB_ABS" "$WORK_DIR/bnb"
+                        prepare_serial_worker "$WORK_DIR" "$ROOT_DIR"
 
                         cd "$WORK_DIR"
 
@@ -1938,13 +1910,13 @@ generate_outinp() {
                         SCALE=30000
                         apply_exp "$INS_ABS" "$SCALE" "$VAL" "$BASE_SYNTH1" \
                             TESTED_SCALE1
-                        ./bnb "$GRAPHLET_K" "$BASE_SYNTH1" > "vecBS1_val_${VAL}.txt"
+                        run_bnb "$GRAPHLET_K" "$BASE_SYNTH1" > "vecBS1_val_${VAL}.txt"
                         displ "$VEC_INS_ABS" "vecBS1_val_${VAL}.txt" "trfBS1_val_${VAL}.txt"
 
                         SCALE=300000
                         apply_exp "$INS_ABS" "$SCALE" "$VAL" "$BASE_SYNTH2" \
                             TESTED_SCALE2
-                        ./bnb "$GRAPHLET_K" "$BASE_SYNTH2" > "vecBS2_val_${VAL}.txt"
+                        run_bnb "$GRAPHLET_K" "$BASE_SYNTH2" > "vecBS2_val_${VAL}.txt"
 #set +x
                         displ "$VEC_INS_ABS" "vecBS2_val_${VAL}.txt" "trfBS2_val_${VAL}.txt"
 
@@ -1969,47 +1941,22 @@ generate_outinp() {
                         # mv is atomic on the same filesystem, so run_round never sees a half-written file.
                         mv "$OUT_INP" "$ROOT_DIR/outinp_val_${VAL}.txt"
                         echo "Finished $VAL result (tested scales: $TESTED_SCALE1, $TESTED_SCALE2)"
-                ) &
-
-                PIDS+=("$!")
-
-                # Keep at most MAX_JOBS candidates alive at once.
-                if (( ${#PIDS[@]} >= MAX_JOBS )); then
-                        if ! wait "${PIDS[0]}"; then
-                                FAILED=1
-                        fi
-                        PIDS=("${PIDS[@]:1}")
-                fi
+                )
         done
-
-        # Wait for the final partial batch.
-        local PID
-        for PID in "${PIDS[@]}"; do
-                if ! wait "$PID"; then
-                        FAILED=1
-                fi
-        done
-
-        if (( FAILED )); then
-                echo "At least one parallel generate_outinp job failed." >&2
-                return 1
-        fi
 }
 
 # Main loop
 CURRENT="$INIT_SYNTH"
-./bnb "$GRAPHLET_K" "$TARGET" > vecTar.txt
+run_bnb "$GRAPHLET_K" "$TARGET" > vecTar.txt
 
 # Phase 1: the requested number of dynamic-weight RSEAS rounds. Probe curves
 # are regenerated on rounds 1, 1+RBGO, 1+2*RBGO, ... within this phase.
 for ((i=1; i<=ROUNDS; i++)); do
     set_round_constraints "$i"
-    ./bnb "$GRAPHLET_K" "$CURRENT" > vecInS.txt
+    run_bnb "$GRAPHLET_K" "$CURRENT" > vecInS.txt
     set_round_rseas_state "$i" vecInS.txt vecTar.txt
 
     if (( (i-1) % RBGO == 0 )); then
-        ./bnb 4 "$CURRENT" > bres.tmp
-        cat data_middle.txt > data_middle1.txt
         refresh_rare_graphlets data_middle1.txt
         generate_outinp "$CURRENT"
     fi
@@ -2036,9 +1983,7 @@ for ((j=1; j<=RMSE_ROUNDS; j++)); do
     set_rmse_round_constraints "$j"
 
     if (( (j-1) % RBGO == 0 )); then
-        ./bnb "$GRAPHLET_K" "$CURRENT" > vecInS.txt
-        ./bnb 4 "$CURRENT" > bres.tmp
-        cat data_middle.txt > data_middle1.txt
+        run_bnb "$GRAPHLET_K" "$CURRENT" > vecInS.txt
         refresh_rare_graphlets data_middle1.txt
         generate_outinp "$CURRENT"
     fi

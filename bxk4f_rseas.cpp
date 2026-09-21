@@ -7,6 +7,10 @@ using Vec = vector<double>;
 
 namespace {
 
+// Support transformation IDs through 95, including the new modes 84..95.
+// IDs 25/26 stay disabled: 93 usable modes and 95 batch metadata slots.
+constexpr int MAX_TRANSFORMATION = 95;
+
 constexpr double LOG_FLOOR = -15.0;
 
 double safe_log(double value) {
@@ -210,21 +214,23 @@ vector<Transformation> read_batch(istream& input, Vec& initial, Vec& target) {
                             "bxk4f executables together for the batch interface");
     }
     const int count = read_integer(input, "transformation count");
-    if (count < 1 || count > 60) {
-        throw runtime_error("transformation count must be in [1,60]");
+    if (count < 1 || count > MAX_TRANSFORMATION) {
+        throw runtime_error("transformation count must be in [1," +
+                            to_string(MAX_TRANSFORMATION) + "]");
     }
     read_vector(input, initial, "current", true);
     read_vector(input, target, "target", true);
 
-    array<bool, 61> seen{};
+    array<bool, MAX_TRANSFORMATION + 1> seen{};
     vector<Transformation> transformations;
     transformations.reserve(static_cast<size_t>(count));
     size_t active_count = 0;
     for (int record = 0; record < count; ++record) {
         Transformation t(initial.size());
         t.id = read_integer(input, "transformation ID");
-        if (t.id < 1 || t.id > 60 || seen[t.id]) {
-            throw runtime_error("transformation IDs must be distinct and in [1,60]");
+        if (t.id < 1 || t.id > MAX_TRANSFORMATION || seen[t.id]) {
+            throw runtime_error("transformation IDs must be distinct and in [1," +
+                                to_string(MAX_TRANSFORMATION) + "]");
         }
         seen[t.id] = true;
         t.edge_change = read_integer(input, "edge change for " + to_string(t.id));

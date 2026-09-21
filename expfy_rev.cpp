@@ -1,9 +1,9 @@
-// expfyc: modes 1--83 retained; learned inverses 84--95 added.
-// Mode 73: compare proposed G6->G5 results with actual existing G5 stars.
+// expfyb: modes 1--83 retained; learned inverses 84--95 added.
+// Mode 73: compare existing G6 paths against hypothetical G5->G6 paths.
 // Native continuous model; automatic training per invocation; C++17.
-// Cutoff: maximize calibration path gate at the requested source precision.
-// T73--T95: ML filtering plus ordinary structural/degree/histogram constraints only.
-// Exact graphlet-effect verification and auditing have been removed.
+// Cutoff: maximize calibration existing-path gate with source precision >= target.
+// The source labels do not indicate whether the reverse edit improves graphlets.
+// T73--T95: exact graphlet verification and auditing are absent.
 #include <algorithm>
 #include <array>
 #include <fstream>
@@ -366,7 +366,7 @@ constexpr array<int8_t, MAX_TRANSFORMATION + 1> make_required_gid_table() {
     table[70] = 6;  // Degree-preserving leaf/branch switch creating boxes.
     table[71] = 7;  // Open an isolated triangle into boxes using a leaf swap.
     table[72] = 7;  // Open a triangle and exchange a branch, keeping hub degrees.
-    table[73] = 6;  // Accept a P4-to-star edit when its resulting star scores highly.
+    table[73] = 6;  // Convert an existing P4 that scores like a star-derived P4.
     table[74] = 5;  // Learned inverse of T9: star -> path.
     table[75] = 6;  // Learned inverse of T4: degree-preserving path switch.
     table[76] = 7;  // Learned inverse of T22: paw -> cycle.
@@ -483,38 +483,20 @@ struct EdgeOp {
 // ---------------------------------------------------------------------------
 using DegreeTuple73 = array<int, 4>;
 
-// A star is represented as (leaf_low, leaf_mid, CENTER, leaf_high).
-// Only the three leaf coordinates are sorted. This gives exact leaf-permutation
-// invariance without creating six copies of each training observation.
-// Sorting is continuous, though not differentiable at tied leaf values.
-DegreeTuple73 canonical_star73(DegreeTuple73 star) {
-    if (star[0] > star[1]) swap(star[0], star[1]);
-    if (star[1] > star[3]) swap(star[1], star[3]);
-    if (star[0] > star[1]) swap(star[0], star[1]);
-    return star;
-}
-
-DegreeTuple73 reversed_path73(const DegreeTuple73& path) {
-    return {path[3], path[2], path[1], path[0]};
-}
-
-// Path A-B-C-D -> star centered at C: remove A-B; add A-C.
-// The endpoint A keeps its degree, B loses one, and C gains one.
-DegreeTuple73 star_from_path73(const DegreeTuple73& path) {
-    if (path[0] < 1 || path[1] < 2 || path[2] < 2 || path[3] < 1 ||
-        path[2] == numeric_limits<int>::max())
-        throw runtime_error("invalid degree tuple for an induced P4 proposal");
-    return canonical_star73({path[0], path[1]-1, path[2]+1, path[3]});
+// Star C-A, C-B, C-D -> path A-B-C-D by removing C-A and adding A-B.
+// Input: (degree(A), degree(B), degree(C), degree(D)), with C the center.
+// Output is hypothetical: no live graph is modified during collection.
+DegreeTuple73 path_from_star73(const DegreeTuple73& star) {
+    if (star[0] < 1 || star[1] < 1 || star[2] < 3 || star[3] < 1 ||
+        star[1] == numeric_limits<int>::max())
+        throw runtime_error("invalid degree tuple for an induced star");
+    return {star[0], star[1]+1, star[2]-1, star[3]};
 }
 
 struct Example73 {
-    DegreeTuple73 degree{}; // Canonical actual or hypothetical G5 degrees.
-    bool from_star = false; // true = ACTUAL existing G5, false = proposed G6->G5.
-    int partition = 0;      // 0=fit, 1=cutoff calibration, 2=held-out diagnostic.
-    DegreeTuple73 path{};   // Pre-edit P4 degrees for negative-source examples.
-    DegreeTuple73 alternative{}; // The other proposed star when BOTH=1.
-    bool has_alternative = false;
-    size_t group = 0;
+    DegreeTuple73 degree{}; // Ordered path A-B-C-D degrees; never sorted.
+    bool from_star = false;  // false=defdeg; true=moddeg, the desired source.
+    int partition = 0;  // 0=fit, 1=cutoff calibration, 2=held-out diagnostic
 };
 
 long long env_integer73(const char* name, long long fallback,
@@ -569,7 +551,7 @@ void warn_removed_effect_options(int mode) {
 
 struct Config73 {
     long long data_attempts = 50000;
-    double min_source_precision = 0.90;  // Flagged real stars / all flagged source rows.
+    double min_source_precision = 0.90;  // Flagged star-derived paths / all flagged source rows.
     double C = 0.5;
     int max_iterations = 500;
     bool both_orientations = false;
@@ -602,66 +584,13 @@ uint64_t mix73(uint64_t x) {
     return x ^ (x >> 31);
 }
 
-int grouped_partition73(DegreeTuple73 star, uint64_t seed) {
-    star = canonical_star73(star);
+int grouped_partition73(DegreeTuple73 t, uint64_t seed) {
+    DegreeTuple73 reversed = {t[3], t[2], t[1], t[0]};
+    if (reversed < t) t = reversed;
     uint64_t h = mix73(seed ^ 0x6a09e667f3bcc909ULL);
-    for (int value : star) h = mix73(h ^ static_cast<uint64_t>(value));
+    for (int value : t) h = mix73(h ^ static_cast<uint64_t>(value));
     const int bucket = static_cast<int>(h % 10);
     return bucket < 6 ? 0 : bucket < 8 ? 1 : 2;
-}
-
-// Join observations sharing an identical star representation, even across
-// labels; also join the two orientations of an original path. With BOTH=1,
-// both hypothetical outcomes join the same component. Thus alternate scoring
-// cannot expose a held-out example to a representation used for fitting.
-// No labels are used to form the groups. Large connected groups can make the
-// 60/20/20 observation proportions uneven; the actual counts are reported.
-size_t assign_partitions73(vector<Example73>& examples, uint64_t seed) {
-    const size_t n = examples.size();
-    vector<size_t> parent(n), sizes(n,1);
-    iota(parent.begin(), parent.end(), size_t{0});
-    auto root = [&](size_t i) {
-        while (parent[i] != i) {
-            parent[i] = parent[parent[i]];
-            i = parent[i];
-        }
-        return i;
-    };
-    auto join = [&](size_t i, size_t j) {
-        i = root(i); j = root(j);
-        if (i == j) return;
-        if (sizes[i] < sizes[j]) swap(i,j);
-        parent[j] = i; sizes[i] += sizes[j];
-    };
-    map<DegreeTuple73,size_t> first_star, first_path;
-    auto connect = [&](map<DegreeTuple73,size_t>& first,
-                       const DegreeTuple73& key, size_t i) {
-        auto entry = first.emplace(key,i);
-        if (!entry.second) join(i,entry.first->second);
-    };
-    for (size_t i = 0; i < n; ++i) {
-        auto& e = examples[i];
-        e.degree = canonical_star73(e.degree);
-        connect(first_star,e.degree,i);
-        if (e.has_alternative) {
-            e.alternative = canonical_star73(e.alternative);
-            connect(first_star,e.alternative,i);
-        }
-        if (!e.from_star)
-            connect(first_path,min(e.path,reversed_path73(e.path)),i);
-    }
-    map<size_t,DegreeTuple73> group_key;
-    for (size_t i = 0; i < n; ++i) {
-        const auto& e = examples[i];
-        auto key = e.has_alternative ? min(e.degree,e.alternative) : e.degree;
-        auto entry = group_key.emplace(root(i),key);
-        if (!entry.second) entry.first->second = min(entry.first->second,key);
-    }
-    for (size_t i = 0; i < n; ++i) {
-        examples[i].group = root(i);
-        examples[i].partition = grouped_partition73(group_key.at(root(i)),seed);
-    }
-    return group_key.size();
 }
 
 class SmoothSourceModel73 {
@@ -685,10 +614,7 @@ public:
     double final_gradient = numeric_limits<double>::infinity();
     double final_objective = numeric_limits<double>::infinity();
 
-    static array<double, VARIABLES> variables_from_logs(array<double, 4> l) {
-        if (l[0] > l[1]) swap(l[0],l[1]);
-        if (l[1] > l[3]) swap(l[1],l[3]);
-        if (l[0] > l[1]) swap(l[0],l[1]);
+    static array<double, VARIABLES> variables_from_logs(const array<double, 4>& l) {
         return {l[0], l[1], l[2], l[3],
                 l[0]-l[1], l[0]-l[2], l[0]-l[3],
                 l[1]-l[2], l[1]-l[3], l[2]-l[3]};
@@ -740,7 +666,7 @@ public:
         return e/(1.0+e);
     }
 
-    // Larger scores mean more similar to an ACTUAL existing star. These are
+    // Larger scores mean more similar to a star-derived path. These are
     // source-classification scores, not probabilities of a beneficial edit.
     double score_variables(const array<double, VARIABLES>& v) const {
         double s = intercept;
@@ -774,18 +700,11 @@ public:
         iterations = 0;
         // Aggregate exact duplicates while preserving every observation's
         // weight, including conflicting labels on the same degree tuple.
-        map<DegreeTuple73, array<double, 2>> counts;
+        map<DegreeTuple73, array<long long, 2>> counts;
         long long total = 0, positives = 0;
         for (const auto& e : examples) {
             if (e.partition != 0) continue;
-            if (e.has_alternative && !e.from_star) {
-                // One path stays one observation: two orientations share its
-                // fitting weight instead of doubling the negative class.
-                counts[canonical_star73(e.degree)][0] += 0.5;
-                counts[canonical_star73(e.alternative)][0] += 0.5;
-            } else {
-                counts[canonical_star73(e.degree)][e.from_star ? 1 : 0] += 1.0;
-            }
+            counts[e.degree][e.from_star ? 1 : 0]++;
             ++total;
             positives += e.from_star;
         }
@@ -938,7 +857,7 @@ public:
     }
 
     void save(ostream& out) const {
-        out << "EXPFY_NATIVE_STAR73_V1\n" << setprecision(17);
+        out << "EXPFY_NATIVE_LINE73_V1\n" << setprecision(17);
         out << intercept << ' ' << cutoff << '\n';
         for (int j = 0; j < VARIABLES; ++j)
             out << lower[j] << ' ' << upper[j] << '\n';
@@ -947,10 +866,10 @@ public:
 };
 
 // A row is one sampled example, not a unique tuple. Repeated rows keep their
-// observation weight. Larger scores mean more actual-star-like.
+// observation weight. Larger scores mean more star-derived-path-like.
 struct ScoredSource73 {
     double score = 0.0;
-    bool from_star = false;  // false=proposed G6->G5; true=actual existing G5.
+    bool from_star = false;  // false=existing G6 (defdeg); true=star-derived G6 (moddeg).
 };
 
 struct ThresholdPoint73 {
@@ -1053,10 +972,10 @@ void print_threshold_point73(ostream& out, const char* name,
     const double rate = path_total ? static_cast<double>(point.path_calls)/path_total
                                       : numeric_limits<double>::quiet_NaN();
     out << "[73] " << name << ": cutoff=" << point.cutoff
-        << " proposed5_flagged=" << point.path_calls << '/' << path_total
+        << " defdeg_flagged=" << point.path_calls << '/' << path_total
         << " path_gate_rate=" << rate
         << " source_precision=" << point.precision()
-        << " (real5_flagged=" << point.star_calls
+        << " (moddeg_flagged=" << point.star_calls
         << ", all_flagged=" << point.calls() << ")\n";
 }
 
@@ -1066,7 +985,7 @@ void print_max_gate_choice73(ostream& out, const ThresholdChoice73& choice,
         << "[73] objective: maximize path_gate_rate subject to source_precision >= "
         << min_precision << "; no path-rate minimum or maximum\n"
         << "[73] calibration_paths=" << choice.path_total
-        << " calibration_real_stars=" << choice.star_total << '\n';
+        << " calibration_star_derived_paths=" << choice.star_total << '\n';
     if (choice.feasible) {
         print_threshold_point73(out,"CHOSEN calibration",choice.chosen,choice.path_total);
         out << "[73] Maximum qualifying path gate among all whole-score thresholds "
@@ -1083,7 +1002,7 @@ void print_max_gate_choice73(ostream& out, const ThresholdChoice73& choice,
             out << "[73] Both calibration sources must be nonempty.\n";
         else if (choice.has_best_with_precision) {
             out << "[73] Best qualifying calibration path_gate_rate=0. "
-                    "Only real-star rows can be flagged at the requested precision.\n";
+                    "Only star-derived-path rows can be flagged at the requested precision.\n";
             print_threshold_point73(out,"zero-path qualifying threshold (NOT deployed)",
                                     choice.best_with_precision,choice.path_total);
         }
@@ -1842,7 +1761,7 @@ public:
 private:
     // Independent learner/cutoff per requested inverse; mode 73 remains intact.
     map<int,InverseState> inverse_states_;
-    static constexpr bool INVERSE_SOURCE_SPACE = true;
+    static constexpr bool INVERSE_SOURCE_SPACE = false;
 
     bool apply_inverse_operations(const InverseOperations& o,bool commit,
                                   OperationFailure73* failure=nullptr) {
@@ -2100,25 +2019,18 @@ private:
     SmoothSourceModel73 model73_;
     Counters73 counters73_;
     ofstream accepted_log73_;
-    double tuple_score73(const DegreeTuple73& star) const {
-        // Only star descriptors belong here. No degree adjustment happens
-        // inside the fitted classifier itself.
-        for (int d : star)
+    double tuple_score73(const DegreeTuple73& t) const {
+        // Inputs are already paths. Do not apply a path-to-star degree shift.
+        for (int d : t)
             if (d <= 0 || d >= graph_.n) return -numeric_limits<double>::infinity();
-        return model73_.score_logs({log_degree_[star[0]], log_degree_[star[1]],
-                                    log_degree_[star[2]], log_degree_[star[3]]});
+        return model73_.score_logs({log_degree_[t[0]], log_degree_[t[1]],
+                                    log_degree_[t[2]], log_degree_[t[3]]});
     }
 
-    double path_gate_score73(const DegreeTuple73& path) const {
-        const double first = tuple_score73(star_from_path73(path));
+    double path_gate_score73(const DegreeTuple73& t) const {
+        const double first = tuple_score73(t);
         if (!config73_.both_orientations) return first;
-        return max(first,tuple_score73(star_from_path73(reversed_path73(path))));
-    }
-
-    double example_gate_score73(const Example73& e) const {
-        // Actual stars are already in the output space: DO NOT transform them.
-        // Each negative source row is a path, tested with the live gate policy.
-        return e.from_star ? tuple_score73(e.degree) : path_gate_score73(e.path);
+        return max(first, tuple_score73({t[3],t[2],t[1],t[0]}));
     }
 
     void prepare_model73() {
@@ -2133,8 +2045,8 @@ private:
              << " min_source_precision=" << config73_.min_source_precision
              << " both=" << config73_.both_orientations
              << " graphlet_effect_checks=removed\n";
-        cerr << "[73] representation=star_space leaf_order=sorted center_coordinate=3\n"
-             << "[73] labels: proposed_G6_to_G5=0, real_existing_G5=1. "
+        cerr << "[73] representation=line_space order=A-B-C-D (not sorted)\n"
+             << "[73] labels: existing_P4=0, hypothetical_star_to_P4=1. "
              << "These are provenance labels, NOT edit-improvement labels.\n";
 
         // Use the same biased four-set sampler as expfy, with an independent
@@ -2145,18 +2057,9 @@ private:
         examples.reserve(static_cast<size_t>(min(config73_.data_attempts, 200000LL)));
         array<array<long long,2>,3> sizes{};
         auto record = [&](const DegreeTuple73& t, bool from_star) {
-            Example73 e;
-            e.from_star = from_star;
-            if (from_star) {
-                e.degree = canonical_star73(t);
-            } else {
-                e.path = t;
-                e.degree = star_from_path73(t);
-                e.has_alternative = config73_.both_orientations;
-                if (e.has_alternative)
-                    e.alternative = star_from_path73(reversed_path73(t));
-            }
-            examples.push_back(e);
+            const int partition = grouped_partition73(t, seed73_);
+            examples.push_back({t,from_star,partition});
+            sizes[partition][from_star ? 1 : 0]++;
         };
         for (long long attempt = 0; attempt < config73_.data_attempts; ++attempt) {
             ++counters73_.training_attempts;
@@ -2182,12 +2085,12 @@ private:
                     else if (sub_degree(sub,i) == 1) leaves[found++] = i;
                 }
                 if (center < 0 || found != 3) continue;
-                // A genuine G5: store its current degrees, with the center
-                // third. No hypothetical forward star-to-path edit is used.
-                record({graph_.degree[nodes[leaves[0]]],
+                // Star C-A,C-B,C-D -> path A-B-C-D after removing C-A,
+                // adding A-B. Exactly the degree convention of expfydc.
+                record(path_from_star73({graph_.degree[nodes[leaves[0]]],
                         graph_.degree[nodes[leaves[1]]],
                         graph_.degree[nodes[center]],
-                        graph_.degree[nodes[leaves[2]]]}, true);
+                        graph_.degree[nodes[leaves[2]]]}), true);
             } else if (gid == 6) {
                 array<int,2> leaves{};
                 int found = 0;
@@ -2205,52 +2108,38 @@ private:
             }
         }
         rng_ = saved_rng;
-        const size_t group_count = assign_partitions73(examples,seed73_);
-        for (const auto& e : examples) ++sizes[e.partition][e.from_star ? 1 : 0];
         const auto collected = chrono::steady_clock::now();
         for (int p = 0; p < 3; ++p) {
             static const char* names[] = {"fit", "calibration", "heldout"};
-            cerr << "[73] " << names[p] << ": proposed_from_paths=" << sizes[p][0]
-                 << " real_stars=" << sizes[p][1] << '\n';
+            cerr << "[73] " << names[p] << ": existing_paths=" << sizes[p][0]
+                 << " star_derived=" << sizes[p][1] << '\n';
         }
-        cerr << "[73] representation_groups=" << group_count
-             << "; equal star descriptions and related path orientations share one partition. "
-                "No all-data refit follows calibration.\n";
+        cerr << "[73] all copies of a degree tuple, including its reverse, "
+                "share one partition. No all-data refit follows calibration.\n";
 
         if (!config73_.dump_directory.empty()) {
             namespace fs = std::filesystem;
             fs::create_directories(config73_.dump_directory);
             const fs::path dir(config73_.dump_directory);
-            ofstream existing(dir/"existing5.txt"), proposed(dir/"modified6to5.txt"),
-                     all(dir/"samples.csv");
-            if (!existing || !proposed || !all) throw runtime_error("cannot write mode73 data dump");
-            all << "sample_id,leaf_low,leaf_mid,center,leaf_high,real_star,partition,group,"
-                   "path_a,path_b,path_c,path_d,has_alternative,"
-                   "alt_leaf_low,alt_leaf_mid,alt_center,alt_leaf_high\n";
-            for (size_t id = 0; id < examples.size(); ++id) {
-                const auto& e = examples[id];
-                ostream& out = e.from_star ? static_cast<ostream&>(existing) : static_cast<ostream&>(proposed);
+            ofstream existing(dir/"defdeg"), derived(dir/"moddeg"), all(dir/"samples.csv");
+            if (!existing || !derived || !all) throw runtime_error("cannot write mode73 data dump");
+            all << "w,x,y,z,from_star,partition\n";
+            for (const auto& e : examples) {
+                ostream& out = e.from_star ? static_cast<ostream&>(derived) : static_cast<ostream&>(existing);
                 out << e.degree[0] << ' ' << e.degree[1] << ' ' << e.degree[2] << ' ' << e.degree[3] << '\n';
-                all << id;
-                for (int value : e.degree) all << ',' << value;
-                all << ',' << e.from_star << ',' << e.partition << ',' << e.group;
-                for (int value : e.path) all << ',' << value;
-                all << ',' << e.has_alternative;
-                for (int value : e.alternative) all << ',' << value;
-                all << '\n';
+                all << e.degree[0] << ',' << e.degree[1] << ',' << e.degree[2] << ','
+                    << e.degree[3] << ',' << e.from_star << ',' << e.partition << '\n';
             }
-            existing.close(); proposed.close(); all.close();
-            if (!existing || !proposed || !all) throw runtime_error("cannot finish mode73 data dump");
+            existing.close(); derived.close(); all.close();
+            if (!existing || !derived || !all) throw runtime_error("cannot finish mode73 data dump");
             accepted_log73_.open(dir/"accepted.csv");
             if (!accepted_log73_) throw runtime_error("cannot write mode73 edit log");
-            accepted_log73_ << "edit,a,b,c,d,degree_a,degree_b,degree_c,degree_d,"
-                               "star_leaf_low,star_leaf_mid,star_center,star_leaf_high,"
-                               "source_score,cutoff,exact_known,delta_G5,delta_G6,delta_G7,delta_G8,delta_G9,delta_G10\n";
+            accepted_log73_ << "edit,a,b,c,d,degree_a,degree_b,degree_c,degree_d,source_score,cutoff,exact_known,delta_G5,delta_G6,delta_G7,delta_G8,delta_G9,delta_G10\n";
             accepted_log73_ << setprecision(17);
         }
         if (sizes[1][0] < 20 || sizes[1][1] < 20 || !model73_.train(examples, config73_.C, config73_.max_iterations)) {
             cerr << "[73] DISABLED: need >=20 fitting examples per source, >=10 distinct fitting "
-                    "star descriptors and >=20 calibration rows per source. Increase DATA_ATTEMPTS "
+                    "tuples and >=20 calibration rows per source. Increase DATA_ATTEMPTS "
                     "or inspect whether both graphlets exist.\n";
             cerr.precision(previous_precision);
             return;
@@ -2263,27 +2152,26 @@ private:
         if (!model73_.converged)
             cerr << "[73] WARNING: optimizer tolerance not reached; using last finite iterate.\n";
 
-        // Score actual stars directly. Score paths only AFTER the hypothetical
-        // G6->G5 degree adjustment. With BOTH=1 a path row uses the maximum of
-        // its two candidate stars; an actual star still has only one score.
-        // Calibration counts each sampled path/star once, never six times.
+        // Score both sources using the SAME rule that defines a path gate.
+        // With BOTH=1 this is max(score(t),score(reverse(t))) for BOTH classes.
+        // Each row still counts once, not once per successful orientation.
         vector<ScoredSource73> calibration_scores;
         vector<ScoredSource73> source_test;
         ofstream score_dump;
         if (!config73_.dump_directory.empty()) {
             score_dump.open(std::filesystem::path(config73_.dump_directory)/"scored_samples.csv");
             if (!score_dump) throw runtime_error("cannot write mode73 score dump");
-            score_dump << "sample_id,real_star,partition,gate_score\n" << setprecision(17);
+            score_dump << "w,x,y,z,from_star,partition,gate_score\n" << setprecision(17);
         }
-        for (size_t id = 0; id < examples.size(); ++id) {
-            const auto& e = examples[id];
+        for (const auto& e : examples) {
             if (e.partition == 0) continue;
-            const double score = example_gate_score73(e);
+            const double score = path_gate_score73(e.degree);
             if (!isfinite(score)) throw runtime_error("nonfinite mode73 held-out score");
             if (e.partition == 1) calibration_scores.push_back({score,e.from_star});
             else source_test.push_back({score,e.from_star});
             if (score_dump.is_open()) {
-                score_dump << id << ',' << e.from_star << ',' << e.partition << ',' << score << '\n';
+                for (int value : e.degree) score_dump << value << ',';
+                score_dump << e.from_star << ',' << e.partition << ',' << score << '\n';
             }
         }
         if (score_dump.is_open()) {
@@ -2312,7 +2200,7 @@ private:
         const bool heldout_precision_ok = test_point.calls() &&
             test_point.precision() >= config73_.min_source_precision;
         cerr << "[73] heldout_precision_target_met=" << heldout_precision_ok
-             << " heldout_real_stars=" << test_derived << '\n';
+             << " heldout_moddeg=" << test_derived << '\n';
         if (enabled73_ && !heldout_precision_ok)
             cerr << "[73] WARNING: the precision target did not hold on held-out rows "
                     "(or there were no held-out flags). The cutoff is unchanged; "
@@ -2339,9 +2227,9 @@ private:
         const double auc = positives && negatives ? pairs/(static_cast<double>(positives)*negatives)
                                                    : numeric_limits<double>::quiet_NaN();
         cerr << "[73] heldout_source_AUC_gate_score=" << auc
-             << " gate=" << (config73_.both_orientations ? "max_of_two_proposed_stars" : "single_proposed_star")
+             << " gate=" << (config73_.both_orientations ? "max_of_two_orientations" : "single_orientation")
              << '\n';
-        cerr << "[73] Source precision means REAL G5 rows among flagged real_G5 + proposed_G6_to_G5 rows. "
+        cerr << "[73] Source precision means moddeg among flagged defdeg+moddeg rows. "
                 "It does NOT measure successful graphlet-improving edits.\n";
         if (isfinite(auc) && auc < 0.55)
             cerr << "[73] WARNING: weak held-out source discrimination; validate actual edit effects.\n";
@@ -2352,7 +2240,7 @@ private:
             report << setprecision(17);
             print_max_gate_choice73(report,choice,config73_.min_source_precision);
             print_threshold_point73(report,"HELDOUT (not used for selection)",test_point,test_existing);
-            curve << "cutoff,proposed5_flagged,real5_flagged,path_gate_rate,source_precision,accepts_path,meets_min_precision,chosen\n";
+            curve << "cutoff,defdeg_flagged,moddeg_flagged,path_gate_rate,source_precision,accepts_path,meets_min_precision,chosen\n";
             curve << setprecision(17);
             for (const auto& p : choice.curve) {
                 curve << p.cutoff << ',' << p.path_calls << ',' << p.star_calls << ','
@@ -2383,8 +2271,7 @@ private:
         const DegreeTuple73 degrees = {graph_.degree[a], graph_.degree[b],
                                         graph_.degree[c], graph_.degree[d]};
         ++counters73_.orientations_scored;
-        const DegreeTuple73 proposed_star = star_from_path73(degrees);
-        const double score = tuple_score73(proposed_star);
+        const double score = tuple_score73(degrees);
         if (!isfinite(score) || score < model73_.cutoff) {
             ++counters73_.model_reject;
             return false;
@@ -2404,7 +2291,6 @@ private:
         if (accepted_log73_.is_open()) {
             accepted_log73_ << counters73_.committed << ',' << a << ',' << b << ',' << c << ',' << d;
             for (int value : degrees) accepted_log73_ << ',' << value;
-            for (int value : proposed_star) accepted_log73_ << ',' << value;
             // Keep legacy CSV columns: exact_known=0; deltas are unmeasured.
             accepted_log73_ << ',' << score << ',' << model73_.cutoff << ",0,,,,,,\n";
             if (!accepted_log73_) throw runtime_error("cannot write mode73 accepted edit log");
@@ -3890,18 +3776,11 @@ int main(int argc, char* argv[]) {
     ios::sync_with_stdio(false);
     cin.tie(nullptr);
 
-    // rpll.sh queries backend capabilities before providing graph arguments.
-    if (argc == 2 && string(argv[1]) == "--max-transformation") {
-        cout << MAX_TRANSFORMATION << '\n';
-        return 0;
-    }
-
     if (argc < 10) {
         cerr << "Usage: " << argv[0]
              << " <target_file> <synth_file> <num_samples> <num_samples2>"
              << " <mode> <mode2> <ignored_evb> <degbound_code> <hdgbound>"
-             << " [completed_samples_file]\n"
-             << "   or: " << argv[0] << " --max-transformation\n";
+             << " [completed_samples_file]\n";
         return 1;
     }
 
