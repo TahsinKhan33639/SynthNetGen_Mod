@@ -298,7 +298,16 @@ SearchResult minimize_pair(Transformation& first, Transformation& second,
     if (!both_zero && !opposite) return best;
 
     const vector<double> grid = build_grid(first.curve, second.curve);
-    if (both_zero) {
+    if (first.id == second.id) {
+        // One transformation has one total dose and one modeled response.
+        // Keep the ordinary per-transformation grid bound (2 * probe kb),
+        // rather than doubling its range through two independent slots.
+        const Vec zero(first.curve.A.size(), 0.0);
+        for (double total : grid) {
+            const double candidate = score(response_at(first, total), zero);
+            if (candidate < best.score) best = {total, 0.0, candidate};
+        }
+    } else if (both_zero) {
         vector<const Vec*> first_values, second_values;
         first_values.reserve(grid.size());
         second_values.reserve(grid.size());

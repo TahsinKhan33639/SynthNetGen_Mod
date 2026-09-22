@@ -1,7 +1,7 @@
 #include <bits/stdc++.h>
 using namespace std;
 
-vector<int> deg(20000);
+vector<int> deg;
 
 bool cmp(int a, int b) {
     return deg[a] > deg[b];
@@ -110,6 +110,7 @@ void sample_edge_prob(vector<vector<int>>& adj, int num_samples) {
 
 void readGraph(const string& filename, vector<vector<int>>& adj) {
     ifstream file(filename);
+
     if (!file.is_open()) {
         cerr << "Error: cannot open file '" << filename << "'\n";
         exit(1);
@@ -117,25 +118,47 @@ void readGraph(const string& filename, vector<vector<int>>& adj) {
 
     map<string, int> nodeMap;
     vector<pair<int, int>> edges;
+
     string line, u, v;
     int nodeCount = 0;
 
     while (getline(file, line)) {
         istringstream iss(line);
-        if (!(iss >> u >> v)) continue;
 
-        if (!nodeMap.count(u)) nodeMap[u] = nodeCount++;
-        if (!nodeMap.count(v)) nodeMap[v] = nodeCount++;
+        if (!(iss >> u >> v))
+            continue;
+
+        if (!nodeMap.count(u))
+            nodeMap[u] = nodeCount++;
+
+        if (!nodeMap.count(v))
+            nodeMap[v] = nodeCount++;
 
         int a = nodeMap[u];
         int b = nodeMap[v];
-        edges.push_back({a, b});
+
+        if (a != b)
+            edges.push_back({a, b});
     }
 
     adj.assign(nodeCount, {});
+
+    // Avoid duplicate edges.
+    vector<unordered_set<int>> seen(nodeCount);
+
     for (auto [a, b] : edges) {
-        adj[a].push_back(b);
-        adj[b].push_back(a);
+        if (seen[a].insert(b).second) {
+            seen[b].insert(a);
+
+            adj[a].push_back(b);
+            adj[b].push_back(a);
+        }
+    }
+
+    deg.resize(nodeCount);
+
+    for (int i = 0; i < nodeCount; i++) {
+        deg[i] = (int)adj[i].size();
     }
 }
 

@@ -1,37 +1,8 @@
 #!/bin/bash
-
-# expfyc implements modes 1..95; expfyb currently stops at 83 (25/26 unused).
-# Resolve and query the actual executable before cleanup or entering workers.
-EXPFY_BIN=$(realpath -- "${EXPFY_BIN:-./expfy}") || exit 1
-if [ ! -x "$EXPFY_BIN" ]; then
-    echo "Transformation backend is not executable: $EXPFY_BIN. Run ./build.sh first." >&2
-    exit 1
-fi
-if ! EXPFY_MODE_LIMIT=$("$EXPFY_BIN" --max-transformation); then
-    echo "Cannot query transformation support from $EXPFY_BIN. Rebuild with ./build.sh." >&2
-    exit 1
-fi
-if ! [[ "$EXPFY_MODE_LIMIT" =~ ^[1-9][0-9]{0,8}$ ]]; then
-    echo "Invalid transformation limit from $EXPFY_BIN: '$EXPFY_MODE_LIMIT'." >&2
-    exit 1
-fi
-
-rm -f baseline_val_*.txt outinp_val_*.txt synth1_*.txt \
-      outinp_l_val_*.txt suminp_val_*.txt bext_val_*.txt \
-          inp1l_*.txt synth_base_*.txt tmp_round*.txt PIS*.txt
-rm -f round_results.tmp inp.txt inpl.txt vecBS*.txt vecOutty.txt trfBS.txt target_c.txt smth.txt bres.tmp evh.txt \
-          out_inplxzx.txt data1.txt vecInS.txt vecTar.txt bextxzx.txt suminpxzx.txt data_middle1.txt idk.txt \
-          expfy_samples_done.tmp .expfy_samples_*.tmp
-rm -rf baseline .generate_outinp_* .run_round.*
-
 set -e
 
-# Set graphlet frequency checker
-g++ -O2 bnb.cpp -o bnb
-
-# Launch from the project directory containing bnb, blant, canon_maps, and
-# orca_jesse_blant_table. Candidate work directories must not become BLANT's cwd.
-RPLLB_ROOT_DIR=$(pwd -P)
+SCMD_PROJECT_DIR=$(dirname -- "$(realpath -- "${BASH_SOURCE[0]}")")
+source "$SCMD_PROJECT_DIR/pipeline_runtime.sh"
 
 # Dense-graph setup: compute node orbits once on the initial synthetic graph.
 # Keep this data_middle1.txt unchanged for all later selection and filtering.
@@ -70,7 +41,7 @@ print(n)
 EOF_ORCA_INPUT
     ) || exit 1
 
-    "$RPLLB_ROOT_DIR/orca" 4 "$ORCA_INPUT" "$ORCA_OUTPUT" > smth.txt || exit 1
+    "$SCMD_PROJECT_DIR/orca" 4 "$ORCA_INPUT" "$ORCA_OUTPUT" > smth.txt || exit 1
     # Some ORCA failures return zero: reject empty, partial or malformed output.
     if ! awk -v N="$ORBIT_NODE_COUNT" '
         NF != 15 { bad = 1 }
@@ -80,21 +51,23 @@ EOF_ORCA_INPUT
         echo "ORCA did not produce $ORBIT_NODE_COUNT complete 15-column rows for $GRAPH_ABS." >&2
         exit 1
     fi
-    mv -- "$ORCA_OUTPUT" "$RPLLB_ROOT_DIR/data_middle1.txt" || exit 1
+    mv -- "$ORCA_OUTPUT" "$RUN_DIR/data_middle1.txt" || exit 1
 )
 
-run_bnb() {
+# BLANT must retain its resource-directory cwd, while its captured output is
+# private to this invocation. No graph or scratch file is written there.
+run_bnb() (
     local K="$1"
     local GRAPH_ABS GRAPH_QUOTED
     GRAPH_ABS=$(realpath -- "$2") || return 1
-    # bnb.cpp embeds argv[2] in a /bin/sh command. Pass a POSIX-quoted path
-    # so spaces, apostrophes and shell metacharacters retain their literal meaning.
+    # bnb embeds argv[2] in a shell command; preserve its quoted-path contract.
     GRAPH_QUOTED="'${GRAPH_ABS//\'/\'\\\'\'}'"
-    (
-        cd -- "$RPLLB_ROOT_DIR" || exit 1
-        ./bnb "$K" "$GRAPH_QUOTED"
-    ) || return 1
-}
+    BNB_OUTPUT_FILE=$(mktemp "$PWD/.bnb_output.XXXXXXXX") || return 1
+    export BNB_OUTPUT_FILE
+    trap 'rm -f -- "$BNB_OUTPUT_FILE"' EXIT
+    cd -- "$BLANT_RESOURCE_DIR" || return 1
+    "$SCMD_PROJECT_DIR/bnb" "$K" "$GRAPH_QUOTED"
+)
 
 run_expfy() {
     # Measure the current graph with BLANT while retaining the initial ORCA
@@ -104,7 +77,7 @@ run_expfy() {
         echo "Initial node-selection weights are missing: data_middle1.txt." >&2
         return 1
     fi
-    "$EXPFY_BIN" "$@"
+    invoke_expfy "$@"
 }
 
 # Node-dependent work is calibrated to a 1,000-node graph.  EFFECTIVE_N is
@@ -171,7 +144,6 @@ float_below_by() {
 float_above_by() {
     awk -v A="$1" -v B="$2" -v D="$3" 'BEGIN { exit !(A > B + D) }'
 }
-
 
 # Graphlet-frequency logarithms use the same floor in Bash/Python and in the
 # four phase-specific C++ optimizers.
@@ -388,8 +360,6 @@ set_round_rseas_state() {
     local TARGET_VEC="$3"
     local WORST_INDEX WORST_GRAPHLET MAX_ERROR NEW_ERROR_RANGE WEIGHT_INDEX
     local PREVIOUS_ERROR_RANGE=""
-    local REPEATED_TEXT=""
-    local ERROR_RANGE_TEXT=""
 
     read -r WORST_INDEX WORST_GRAPHLET MAX_ERROR NEW_ERROR_RANGE \
         < <(log_error_summary "$CURRENT_VEC" "$TARGET_VEC")
@@ -400,7 +370,6 @@ set_round_rseas_state() {
         RSEAS_WEIGHTS[$WEIGHT_INDEX]=$((
             RSEAS_WEIGHTS[$WEIGHT_INDEX] + RSEAS_WEIGHT_INCREMENT
         ))
-        REPEATED_TEXT="; repeated worst graphlet, increased its weight by $RSEAS_WEIGHT_INCREMENT"
     fi
 
     PREVIOUS_WORST_INDEX="$WORST_INDEX"
@@ -419,14 +388,7 @@ set_round_rseas_state() {
             'BEGIN {
                 printf "%.17g\n", (CANDIDATE < PREVIOUS ? CANDIDATE : PREVIOUS)
             }')
-
-        if awk -v CANDIDATE="$NEW_ERROR_RANGE" -v PREVIOUS="$PREVIOUS_ERROR_RANGE" \
-            'BEGIN { exit !(CANDIDATE > PREVIOUS) }'; then
-            ERROR_RANGE_TEXT="; candidate e=$NEW_ERROR_RANGE capped at previous e=$PREVIOUS_ERROR_RANGE"
-        fi
     fi
-
-    echo "Round $ROUND_INDEX/$ROUNDS RSEAS state: worst graphlet=$WORST_GRAPHLET, max log error=$MAX_ERROR, e=$RSEAS_E, weights=${RSEAS_WEIGHTS[*]}$REPEATED_TEXT$ERROR_RANGE_TEXT"
 }
 
 configure_node_scaled_parameters() {
@@ -447,7 +409,7 @@ configure_node_scaled_parameters() {
     INIT_MAIN_SAMPLES=$(clamp_int "$(scale_from_reference 10000)" 2500 50000)
     INIT_SECONDARY_SAMPLES=$(clamp_int "$(scale_from_reference 1000)" 250 5000)
 
-    # Preliminary eigenvector rewiring and the per-round EVC probes.
+    # Preliminary spectral rewiring and the per-round EVC probes.
     PIS1_SAMPLES=$(scale_from_reference 3000)
     PIS2_SAMPLES=$(scale_from_reference 1000)
     PIS3_SAMPLES=$(scale_from_reference 400)
@@ -468,9 +430,6 @@ configure_node_scaled_parameters() {
     # The last optimization round uses this value exactly.  Earlier rounds
     # are generated backward from it by multiplying by ROUND_BACKWARD_FACTOR.
     TIGHTEST_HDGB=$(scale_from_reference "$TIGHTEST_HDGB_REFERENCE")
-
-    echo "Graph size: $NODE_COUNT nodes (workload scaling uses $EFFECTIVE_N; clamp $MIN_EFFECTIVE_N..$MAX_EFFECTIVE_N)."
-    echo "PIS samples: $PIS1_SAMPLES, $PIS2_SAMPLES, $PIS3_SAMPLES; outpev samples: $OUTPEV_SMALL_SAMPLES, $OUTPEV_LARGE_SAMPLES."
 }
 
 # Build the constraint schedule backward from the final round. For evb the
@@ -526,8 +485,6 @@ set_round_constraints() {
     evb="${ROUND_EVB_SCHEDULE[$ROUND_INDEX]}"
     degb="${ROUND_DEGB_SCHEDULE[$ROUND_INDEX]}"
     hdgb="${ROUND_HDGB_SCHEDULE[$ROUND_INDEX]}"
-
-    echo "RSEAS round $ROUND_INDEX/$ROUNDS constraints: evb=$evb, degb=$degb, hdgb=$hdgb"
 }
 
 set_rmse_round_constraints() {
@@ -538,8 +495,6 @@ set_rmse_round_constraints() {
     evb="$TIGHTEST_EVB"
     degb="$TIGHTEST_DEGB"
     hdgb="$TIGHTEST_HDGB"
-
-    echo "RMSE polishing round $ROUND_INDEX/$RMSE_ROUNDS constraints: evb=$evb, degb=$degb, hdgb=$hdgb"
 }
 
 INITIAL_GRAPH_GIVEN=0
@@ -562,11 +517,10 @@ elif [ $# -eq 7 ]; then
     RBGO="$7"
     INITIAL_GRAPH_GIVEN=1
 else
-    echo "Usage: $0 <k:4|5> <Target> <Output> <RSEAS_Rounds> <RMSE_Rounds> <RBGO>"
-    echo "   or: $0 <k:4|5> <Target> <Output> <Base_Synth> <RSEAS_Rounds> <RMSE_Rounds> <RBGO>"
+    echo "Usage: $0 <k:4|5> <Target> <Output> <RSEAS_Rounds> <RMSE_Rounds> <RBGO>" >&2
+    echo "   or: $0 <k:4|5> <Target> <Output> <Base_Synth> <RSEAS_Rounds> <RMSE_Rounds> <RBGO>" >&2
     exit 1
 fi
-echo "$TARGET0" >> wcic.txt
 
 if ! [[ "$GRAPHLET_K" =~ ^[45]$ ]]; then
     echo "Graphlet size k must be 4 or 5, not '$GRAPHLET_K'." >&2
@@ -585,10 +539,10 @@ if ! [[ "$RBGO" =~ ^[1-9][0-9]*$ ]]; then
     exit 1
 fi
 
-configure_graphlet_mode
+initialize_pipeline_run bnb
+echo "$TARGET0" >> wcic.txt
 
-echo "Optimizing k=$GRAPHLET_K graphlets with $GRAPHLET_DIM frequency coordinates."
-echo "Schedule: $ROUNDS RSEAS rounds, $RMSE_ROUNDS RMSE rounds, regenerate transformation probes every $RBGO round(s) within each phase."
+configure_graphlet_mode
 
 TARGET="target_c.txt"
 ./cleanup "$TARGET0" "$TARGET"
@@ -596,19 +550,21 @@ configure_node_scaled_parameters
 build_round_constraint_schedule
 
 if (( ! INITIAL_GRAPH_GIVEN )); then
+    echo "Generating baseline."
     ./gen_deg2 "$TARGET" synth_base_1.txt
     initialize_node_weights synth_base_1.txt || exit 1
 
-    run_expfy "$TARGET" synth_base_1.txt "$INIT_PRIMARY_SAMPLES" "$INIT_PRIMARY_SAMPLES" 1 8 2.0 20 "$INIT_HDGB_1" > synth_base_2.txt
-    run_expfy "$TARGET" synth_base_2.txt "$INIT_MAIN_SAMPLES" "$INIT_MAIN_SAMPLES" 1 8 1.7 18 "$INIT_HDGB_2" > synth_base_3.txt
-    run_expfy "$TARGET" synth_base_3.txt "$INIT_MAIN_SAMPLES" "$INIT_MAIN_SAMPLES" 1 8 1.5 18 "$INIT_HDGB_3" > synth_base_4.txt
-    run_expfy "$TARGET" synth_base_4.txt "$INIT_MAIN_SAMPLES" "$INIT_MAIN_SAMPLES" 1 8 1.3 17 "$INIT_HDGB_4" > synth_base_5.txt
-    run_expfy "$TARGET" synth_base_5.txt "$INIT_MAIN_SAMPLES" "$INIT_SECONDARY_SAMPLES" 1 17 1.2 16 "$INIT_HDGB_5" > synth_base_6.txt
-    run_expfy "$TARGET" synth_base_6.txt "$INIT_MAIN_SAMPLES" "$INIT_SECONDARY_SAMPLES" 1 17 1.1 15 "$INIT_HDGB_6" > synth_base_7.txt
-    run_expfy "$TARGET" synth_base_7.txt "$INIT_MAIN_SAMPLES" "$INIT_SECONDARY_SAMPLES" 1 17 1 14 "$INIT_HDGB_7" > synth_base_8.txt
+    run_expfy "$TARGET" synth_base_1.txt "$INIT_PRIMARY_SAMPLES" "$INIT_PRIMARY_SAMPLES" 1 8 20 "$INIT_HDGB_1" > synth_base_2.txt
+    run_expfy "$TARGET" synth_base_2.txt "$INIT_MAIN_SAMPLES" "$INIT_MAIN_SAMPLES" 1 8 18 "$INIT_HDGB_2" > synth_base_3.txt
+    run_expfy "$TARGET" synth_base_3.txt "$INIT_MAIN_SAMPLES" "$INIT_MAIN_SAMPLES" 1 8 18 "$INIT_HDGB_3" > synth_base_4.txt
+    run_expfy "$TARGET" synth_base_4.txt "$INIT_MAIN_SAMPLES" "$INIT_MAIN_SAMPLES" 1 8 17 "$INIT_HDGB_4" > synth_base_5.txt
+    run_expfy "$TARGET" synth_base_5.txt "$INIT_MAIN_SAMPLES" "$INIT_SECONDARY_SAMPLES" 1 17 16 "$INIT_HDGB_5" > synth_base_6.txt
+    run_expfy "$TARGET" synth_base_6.txt "$INIT_MAIN_SAMPLES" "$INIT_SECONDARY_SAMPLES" 1 17 15 "$INIT_HDGB_6" > synth_base_7.txt
+    run_expfy "$TARGET" synth_base_7.txt "$INIT_MAIN_SAMPLES" "$INIT_SECONDARY_SAMPLES" 1 17 14 "$INIT_HDGB_7" > synth_base_8.txt
 
     PRE_INIT_SYNTH=synth_base_8.txt
 else
+    echo "Using supplied baseline."
     if ! SYNTH_NODE_COUNT=$(graph_node_count "$PRE_INIT_SYNTH"); then
         echo "Could not determine the node count from $PRE_INIT_SYNTH." >&2
         exit 1
@@ -664,14 +620,11 @@ accept_pis_candidate() {
     # resample it and accidentally perturb the remembered score.
     if cmp -s "$BEFORE" "$CANDIDATE"; then
         mv "$CANDIDATE" "$OUTPUT"
-        echo "$LABEL made no change; RSEAS remains $PIS_CURRENT_RSEAS."
         return
     fi
 
     local CANDIDATE_RSEAS
     CANDIDATE_RSEAS=$(pis_graph_rseas "$CANDIDATE")
-
-    echo "$LABEL RSEAS: before=$PIS_CURRENT_RSEAS, candidate=$CANDIDATE_RSEAS"
 
     # Preserve the existing behavior for an automatically generated base: the
     # PIS transformation is applied directly.  For a user-supplied base, reject
@@ -679,16 +632,13 @@ accept_pis_candidate() {
     if (( ! INITIAL_GRAPH_GIVEN )); then
         mv "$CANDIDATE" "$OUTPUT"
         PIS_CURRENT_RSEAS="$CANDIDATE_RSEAS"
-        echo "$LABEL accepted."
     elif awk -v NEW="$CANDIDATE_RSEAS" -v OLD="$PIS_CURRENT_RSEAS" \
         'BEGIN { exit !(NEW <= OLD) }'; then
         mv "$CANDIDATE" "$OUTPUT"
         PIS_CURRENT_RSEAS="$CANDIDATE_RSEAS"
-        echo "$LABEL accepted."
     else
         cp "$BEFORE" "$OUTPUT"
         rm -f "$CANDIDATE"
-        echo "$LABEL rejected; keeping the previous graph."
     fi
 }
 
@@ -711,19 +661,15 @@ make_pis_increase_candidate() {
     EVC1_SCORE=$(pis_graph_rseas "$EVC1_CANDIDATE")
     EVC2_SCORE=$(pis_graph_rseas "$EVC2_CANDIDATE")
 
-    echo "$LABEL eigenvalue-increase candidates: evc1 RSEAS=$EVC1_SCORE, evc2 RSEAS=$EVC2_SCORE"
-
     # Prefer evc1 on an exact tie so the old PIS behavior remains the stable
     # tie-breaker. evc3 is selected only when its measured RSEAS is lower.
     if awk -v EVC2="$EVC2_SCORE" -v EVC1="$EVC1_SCORE" \
         'BEGIN { exit !(EVC2 < EVC1) }'; then
         mv "$EVC2_CANDIDATE" "$OUTPUT_CANDIDATE"
         rm -f "$EVC1_CANDIDATE"
-        echo "$LABEL selected evc2."
     else
         mv "$EVC1_CANDIDATE" "$OUTPUT_CANDIDATE"
         rm -f "$EVC2_CANDIDATE"
-        echo "$LABEL selected evc1."
     fi
 }
 
@@ -743,9 +689,6 @@ PIS_CURRENT_RSEAS=$(rseas_with_config f0.txt "$local_pis_initial_displ" \
     "$PIS_RSEAS_E" "${PIS_RSEAS_WEIGHTS[@]}")
 
 rm -f "$local_pis_initial_vec" "$local_pis_initial_displ"
-
-echo "PIS RSEAS state: worst graphlet=$PIS_WORST_GRAPHLET, max log error=$PIS_MAX_ERROR, e=$PIS_RSEAS_E, weights=${PIS_RSEAS_WEIGHTS[*]}"
-echo "Initial graph RSEAS before PIS: $PIS_CURRENT_RSEAS"
 
 PIS1_CANDIDATE="PIS1_candidate.txt"
 ./evs "$PRE_INIT_SYNTH" > evh.txt
@@ -791,6 +734,7 @@ accept_pis_candidate PIS2.txt "$PIS3_CANDIDATE" PIS3.txt PIS3
 
 rm -f "$PIS_TARGET_VEC"
 INIT_SYNTH=PIS3.txt
+echo "Baseline ready."
 
 # Initialize the globals used by apply_exp/apply_exp2.  The main loop resets
 # them from the precomputed schedule at the start of every round.
@@ -801,7 +745,6 @@ MAX_TRANSFORMATION=95
 CANDIDATE_LIMIT="$MAX_TRANSFORMATION"
 if (( ${EXPFY_MODE_LIMIT:-MAX_TRANSFORMATION} < MAX_TRANSFORMATION )); then
     CANDIDATE_LIMIT="$EXPFY_MODE_LIMIT"
-    echo "Selected backend supports modes through $CANDIDATE_LIMIT; later modes are excluded." >&2
 fi
 CANDS=($(seq 1 "$CANDIDATE_LIMIT" | grep -v -E '^(25|26)$'))
 ACTIVE_CANDS=("${CANDS[@]}")
@@ -923,7 +866,7 @@ BASELINE_DIR="baseline"
 mkdir -p "$BASELINE_DIR"
 
 # Keep candidate scratch files in private directories even though work is serial.
-# BLANT-backed bnb calls are routed to the launch directory by run_bnb.
+# BLANT-backed bnb calls use the resource directory through run_bnb.
 prepare_serial_worker() {
     local WORK_DIR="$1"
     local ROOT_DIR="$2"
@@ -938,7 +881,7 @@ prepare_serial_worker() {
     done
 
     # Other tools can still use project-local executables in this directory.
-    # run_bnb explicitly returns to RPLLB_ROOT_DIR for BLANT and its resources.
+    # run_bnb explicitly selects BLANT_RESOURCE_DIR for BLANT and its resources.
     for TOOL in "$ROOT_DIR"/*; do
         if [ ! -f "$TOOL" ]; then
             continue
@@ -1121,13 +1064,10 @@ refresh_rare_graphlets() {
 
     local NODE_COUNT="${STATS[0]}"
     local ENTRY GRAPHLET COUNT VAL INITIAL INDEX
-    local -a RARE_IDS=()
-    local -a SKIPPED=()
 
     graphlet_node_count=()
     rare_graphlet=()
 
-    echo "Graphlet node coverage (rare means at most 0.1% of $NODE_COUNT nodes):"
     for ((INDEX=1; INDEX<${#STATS[@]}; INDEX++)); do
         ENTRY="${STATS[$INDEX]}"
         GRAPHLET="${ENTRY%%:*}"
@@ -1136,11 +1076,8 @@ refresh_rare_graphlets() {
 
         if (( COUNT * 1000 <= NODE_COUNT )); then
             rare_graphlet[$GRAPHLET]=1
-            RARE_IDS+=("$GRAPHLET")
-            echo "  graphlet $GRAPHLET: $COUNT/$NODE_COUNT nodes (rare)"
         else
             rare_graphlet[$GRAPHLET]=0
-            echo "  graphlet $GRAPHLET: $COUNT/$NODE_COUNT nodes"
         fi
     done
 
@@ -1160,25 +1097,11 @@ refresh_rare_graphlets() {
             echo "Transformation $VAL maps to graphlet $INITIAL, which has no data_middle1.txt columns." >&2
             return 1
         elif (( rare_graphlet[INITIAL] )); then
-            SKIPPED+=("$VAL")
             rm -f "outinp_val_${VAL}.txt"
         else
             ACTIVE_CANDS+=("$VAL")
         fi
     done
-
-    if (( ${#RARE_IDS[@]} == 0 )); then
-        echo "Rare graphlets: none"
-    else
-        echo "Rare graphlets: ${RARE_IDS[*]}"
-    fi
-
-    if (( ${#SKIPPED[@]} == 0 )); then
-        echo "Transformations skipped for rarity: none"
-    else
-        echo "Transformations skipped for rarity: ${SKIPPED[*]}"
-    fi
-    echo "Active transformations: ${ACTIVE_CANDS[*]}"
 
     if (( ${#ACTIVE_CANDS[@]} == 0 )); then
         echo "No transformations remain after rare-graphlet filtering." >&2
@@ -1248,7 +1171,7 @@ read_completed_sample_file() {
 
     if ! read -r VALUE1 VALUE2 EXTRA < "$SAMPLE_FILE"; then
         echo "Could not read completed sample counts from $SAMPLE_FILE." >&2
-		cat "$SAMPLE_FILE"
+		cat "$SAMPLE_FILE" >&2
         return 1
     fi
 
@@ -1280,7 +1203,7 @@ apply_exp() {
 
     SAMPLE_FILE=$(mktemp ".expfy_samples.XXXXXX.tmp")
     if ! run_expfy "$TARGET" "$INPUT_FILE" "$REQUESTED_SAMPLES" 0 \
-        "$VAL" 1 "$evb" "$degb" "$hdgb" "$SAMPLE_FILE" \
+        "$VAL" 1 "$degb" "$hdgb" "$SAMPLE_FILE" \
         > "$OUTPUT_FILE"; then
         rm -f "$SAMPLE_FILE" "$OUTPUT_FILE"
         return 1
@@ -1311,6 +1234,20 @@ apply_exp2() {
     local DIVISOR1 DIVISOR2 REQUESTED_SAMPLES1 REQUESTED_SAMPLES2
     local SAMPLE_FILE DONE1 DONE2 TESTED_SCALE1 TESTED_SCALE2
 
+    # Collapse a self-pair before quota rounding/capping and keep completed
+    # counts in the same single-slot coordinates returned by expfy.
+    if (( VAL == VAL2 )); then
+        if (( REQUESTED_SCALE1 < 0 )); then REQUESTED_SCALE1=0; fi
+        if (( REQUESTED_SCALE2 < 0 )); then REQUESTED_SCALE2=0; fi
+        local TOTAL_SCALE=$(( REQUESTED_SCALE1 + REQUESTED_SCALE2 ))
+        if (( TOTAL_SCALE < REQUESTED_SCALE1 || TOTAL_SCALE < REQUESTED_SCALE2 )); then
+            echo "Combined self-pair scale exceeds the integer limit." >&2
+            return 1
+        fi
+        REQUESTED_SCALE1="$TOTAL_SCALE"
+        REQUESTED_SCALE2=0
+    fi
+
     if [ "${ec[$VAL]}" -eq 0 ]; then
         DIVISOR1=60
     else
@@ -1328,7 +1265,7 @@ apply_exp2() {
     SAMPLE_FILE=$(mktemp ".expfy_samples.XXXXXX.tmp")
     if ! run_expfy "$TARGET" "$INPUT_FILE" \
         "$REQUESTED_SAMPLES1" "$REQUESTED_SAMPLES2" "$VAL" "$VAL2" \
-        "$evb" "$degb" "$hdgb" "$SAMPLE_FILE" > "$OUTPUT_FILE"; then
+        "$degb" "$hdgb" "$SAMPLE_FILE" > "$OUTPUT_FILE"; then
         rm -f "$SAMPLE_FILE" "$OUTPUT_FILE"
         return 1
     fi
@@ -1347,7 +1284,6 @@ apply_exp2() {
     printf -v "$TESTED_SCALE_VAR1" '%s' "$TESTED_SCALE1"
     printf -v "$TESTED_SCALE_VAR2" '%s' "$TESTED_SCALE2"
 }
-
 
 # optimization round
 run_round() {
@@ -1370,7 +1306,6 @@ run_round() {
         esac
         local ROOT_DIR
         ROOT_DIR=$(pwd -P)
-
 
         local INPUT_ABS OUTPUT_ABS TARGET_ABS VEC_TAR_ABS F0_ABS
         local EVS_ABS BXK4F_ABS BXK4ONE_ABS
@@ -1404,9 +1339,6 @@ run_round() {
         local had_score
         had_score=$(objective_score "$F0_ABS" "$INPL")
 
-        echo "New $ROUND_OBJECTIVE round with input $INPUT_SYNTH"
-        echo "Evaluating round candidates sequentially"
-
         # ---------------------------------------------------------
         # 1. Generate and evaluate six EVC candidates sequentially: small and
         #    large runs of evc1, evc2, and the union/intersection evc3.
@@ -1434,8 +1366,6 @@ run_round() {
         IFS='|' read -r EVC_REFERENCE_STATUS EVC_REFERENCE_AFTER_DISTANCE \
             CURRENT_EV_DISTANCE EVC_DISTANCE_LIMIT EVC_REFERENCE_REASON \
             <<< "$EVC_REFERENCE"
-
-        echo "EVC eigenvalue gate: target_ev=$TARGET_EV, current_ev=$CURRENT_EV, current_log_distance=$CURRENT_EV_DISTANCE, near_target_limit=$EVC_DISTANCE_LIMIT"
 
         local -a EVC_LABELS=(
             outpev11 outpev12
@@ -1522,14 +1452,12 @@ run_round() {
 
             case "$EVC_STATUS" in
                 ALLOWED)
-                    echo "$LABEL eigenvalue allowed ($CUR_REASON): after_ev=$CUR_EV, log_distance=$CUR_EV_DISTANCE; $ROUND_OBJECTIVE=$CUR_SCORE"
                     if float_less "$CUR_SCORE" "$BEST_EVC_SCORE"; then
                         BEST_EVC_SCORE="$CUR_SCORE"
                         BEST_EVC_GRAPH="$CUR_GRAPH"
                     fi
                     ;;
                 DISALLOWED)
-                    echo "$LABEL eigenvalue disallowed: after_ev=$CUR_EV, log_distance=$CUR_EV_DISTANCE; requires distance < $EVC_DISTANCE_LIMIT or distance < $CURRENT_EV_DISTANCE"
                     ;;
                 *)
                     echo "Invalid EVC result status '$EVC_STATUS' for $LABEL." >&2
@@ -1539,11 +1467,8 @@ run_round() {
         done
 
         if [ "$BEST_EVC_GRAPH" != "$INPUT_ABS" ]; then
-            echo "Replacing $INPUT_SYNTH with the best EVC candidate ($ROUND_OBJECTIVE $BEST_EVC_SCORE)"
             cp "$BEST_EVC_GRAPH" "$INPUT_ABS"
             had_score="$BEST_EVC_SCORE"
-        else
-            echo "No EVC candidate improved the input graph."
         fi
 
         # Recompute the current graph vector after the possible EVC replacement.
@@ -1559,7 +1484,6 @@ run_round() {
         local BATCH_INPUT="$ROUND_DIR/bxk4f_batch_input.tmp"
         local -a BATCH_ENABLED=()
         local BATCH_ID BATCH_PROBE BATCH_PROBE_WORDS
-        local CAND_COUNT=${#ACTIVE_CANDS[@]}
 
         for BATCH_ID in "${ACTIVE_CANDS[@]}"; do
             BATCH_ENABLED[$BATCH_ID]=1
@@ -1593,27 +1517,22 @@ run_round() {
             done
         } > "$BATCH_INPUT"
 
-        echo "Scoring $((CAND_COUNT * (CAND_COUNT + 1) / 2)) pairs from $CAND_COUNT active transformations in one bxk4f call."
+        local BATCH_STATUS=0
+        local BATCH_STDERR="$ROUND_DIR/bxk4f.stderr"
         if [ "$ROUND_OBJECTIVE" = "RSEAS" ]; then
             "$BXK4F_ABS" "$GRAPHLET_K" "$RSEAS_E" "${RSEAS_WEIGHTS[@]}" \
-                < "$BATCH_INPUT" > "$RESULTS_FILE.pending"
+                < "$BATCH_INPUT" > "$RESULTS_FILE.pending" 2> "$BATCH_STDERR" || BATCH_STATUS=$?
         else
             "$BXK4F_ABS" "$GRAPHLET_K" \
-                < "$BATCH_INPUT" > "$RESULTS_FILE.pending"
+                < "$BATCH_INPUT" > "$RESULTS_FILE.pending" 2> "$BATCH_STDERR" || BATCH_STATUS=$?
+        fi
+        if (( BATCH_STATUS != 0 )); then
+            cat "$BATCH_STDERR" >&2
+            exit "$BATCH_STATUS"
         fi
         mv "$RESULTS_FILE.pending" "$RESULTS_FILE"
 
         had_score=$(objective_score "$F0_ABS" "$INPL")
-        echo "$ROUND_OBJECTIVE before modification is $had_score"
-
-        local BAD_ZERO_SCALE_COUNT
-        BAD_ZERO_SCALE_COUNT=$(awk -F'|' '
-            $1 == "BAD_ZERO_SCALE" { count++ }
-            END { print count + 0 }
-        ' "$RESULTS_FILE")
-        if (( BAD_ZERO_SCALE_COUNT > 0 )); then
-            echo "Excluded $BAD_ZERO_SCALE_COUNT mixed pairs because scale=0 implies a redundant candidate; self-pairs were retained."
-        fi
 
         # ---------------------------------------------------------
         # 3. Evaluate the ten most promising nonredundant pairs sequentially.
@@ -1637,6 +1556,15 @@ run_round() {
         local sorted_score sorted_VAL sorted_VAL2 sorted_MAG sorted_MAG2
         local SCALE SCALE2
 
+        echo "Best predicted transformations ($ROUND_OBJECTIVE):"
+        for IDX in "${!TOP_LINES[@]}"; do
+            IFS='|' read -r sorted_score sorted_VAL sorted_VAL2 sorted_MAG sorted_MAG2 \
+                <<< "${TOP_LINES[$IDX]}"
+            printf '  %2d. (%s, %s)  scales=(%s, %s)  predicted %s=%.6g\n' \
+                "$((IDX + 1))" "$sorted_VAL" "$sorted_VAL2" \
+                "$sorted_MAG" "$sorted_MAG2" "$ROUND_OBJECTIVE" "$sorted_score"
+        done
+
         for IDX in "${!TOP_LINES[@]}"; do
             RANK=$((IDX + 1))
             LINE="${TOP_LINES[$IDX]}"
@@ -1646,12 +1574,7 @@ run_round() {
             SCALE2=$(integer_part "$sorted_MAG2")
 
             if (( SCALE <= 0 && SCALE2 <= 0 && RANK > 1 )); then
-                echo "Skipping rank $RANK pair $sorted_VAL,$sorted_VAL2 because both scales are non-positive."
                 continue
-            fi
-
-            if (( SCALE <= 0 && SCALE2 <= 0 && RANK == 1 )); then
-                echo "First candidate has non-positive scales. Forcing evaluation."
             fi
 
             (
@@ -1746,8 +1669,6 @@ run_round() {
                 exit 1
             fi
 
-            echo "VAL=$sorted_VAL,$sorted_VAL2 MAG=$sorted_MAG,MAG2=$sorted_MAG2. expected $ROUND_OBJECTIVE=$EXPECTED_SCORE, got $ROUND_OBJECTIVE=$GOT_SCORE."
-
             if [ -z "$BEST_SCORE" ] || float_less "$GOT_SCORE" "$BEST_SCORE"; then
                 BEST_SCORE="$GOT_SCORE"
                 BEST_VAL="$sorted_VAL"
@@ -1763,14 +1684,15 @@ run_round() {
             exit 1
         fi
 
-        echo "Best pair was $BEST_VAL and $BEST_VAL2 with $ROUND_OBJECTIVE $BEST_SCORE and parameters $BEST_MAG,$BEST_MAG2"
 		echo "$BEST_VAL $BEST_VAL2" >> wcic.txt
 
+        local FINAL_SCORE
         if float_greater "$BEST_SCORE" "$had_score"; then
-            echo "The best evaluated pair was worse than the input ($ROUND_OBJECTIVE $had_score); keeping the input graph."
+            echo "Keeping current graph; no pair improved $ROUND_OBJECTIVE."
             cp "$INPUT_ABS" "$OUTPUT_ABS"
+            FINAL_SCORE="$had_score"
         else
-            echo "Using the saved best candidate, then refining the same pair $PAIR_REFINEMENT_PASSES times."
+            echo "Choosing pair ($BEST_VAL, $BEST_VAL2)."
 
             local REFINE_DIR="$ROUND_DIR/refinement"
             mkdir -p "$REFINE_DIR"
@@ -1845,27 +1767,24 @@ run_round() {
                 displ "$CANDIDATE_VEC" "$VEC_TAR_ABS" "$CANDIDATE_TARGET_DISPL"
                 CANDIDATE_SCORE=$(objective_score "$F0_ABS" "$CANDIDATE_TARGET_DISPL")
 
-                echo "Pair refinement $REFINE_ITER/$PAIR_REFINEMENT_PASSES for $BEST_VAL,$BEST_VAL2: probe scales=$PROBE_TESTED_SCALE,$PROBE_TESTED_SCALE2, multiplier=$MAG_FACTOR, candidate scales=$CANDIDATE_TESTED_SCALE,$CANDIDATE_TESTED_SCALE2, $ROUND_OBJECTIVE=$CANDIDATE_SCORE (current=$REFINE_SCORE)."
-
                 if float_less "$CANDIDATE_SCORE" "$REFINE_SCORE"; then
                     mv "$REFINED_CANDIDATE" "$REFINE_GRAPH"
                     REFINE_SCORE="$CANDIDATE_SCORE"
                     REFINE_SCALE="$CANDIDATE_TESTED_SCALE"
                     REFINE_SCALE2="$CANDIDATE_TESTED_SCALE2"
-                    echo "Pair refinement $REFINE_ITER accepted."
                 else
                     rm -f "$REFINED_CANDIDATE"
-                    echo "Pair refinement $REFINE_ITER rejected; Skipping refinement."
 					break
                 fi
             done
 
             cp "$REFINE_GRAPH" "$OUTPUT_ABS"
-            echo "Final refined pair score: $ROUND_OBJECTIVE=$REFINE_SCORE with latest accepted scales $REFINE_SCALE,$REFINE_SCALE2."
+            FINAL_SCORE="$REFINE_SCORE"
         fi
 
-        echo "Achieved graphlet frequency:"
-        run_bnb "$GRAPHLET_K" "$OUTPUT_ABS"
+        printf 'Got %s = %.6g\n' "$ROUND_OBJECTIVE" "$FINAL_SCORE"
+
+        run_bnb "$GRAPHLET_K" "$OUTPUT_ABS" > /dev/null
     )
 }
 
@@ -1878,11 +1797,6 @@ generate_outinp() {
         INS_ABS=$(realpath "$InS")
         TARGET_ABS=$(realpath "$TARGET")
         VEC_INS_ABS=$(realpath vecInS.txt)
-
-
-        echo
-        echo "Re-getting transformation results sequentially"
-        echo
 
         local VAL
 
@@ -1905,7 +1819,6 @@ generate_outinp() {
                         local OUT_INP="outinp_val_${VAL}.txt"
                         local SCALE TESTED_SCALE1 TESTED_SCALE2
 
-                        echo "Getting $VAL result"
 #set -x
                         SCALE=30000
                         apply_exp "$INS_ABS" "$SCALE" "$VAL" "$BASE_SYNTH1" \
@@ -1940,9 +1853,9 @@ generate_outinp() {
 
                         # mv is atomic on the same filesystem, so run_round never sees a half-written file.
                         mv "$OUT_INP" "$ROOT_DIR/outinp_val_${VAL}.txt"
-                        echo "Finished $VAL result (tested scales: $TESTED_SCALE1, $TESTED_SCALE2)"
                 )
         done
+        echo "Generated all ${#ACTIVE_CANDS[@]} transformation results."
 }
 
 # Main loop
@@ -1952,6 +1865,7 @@ run_bnb "$GRAPHLET_K" "$TARGET" > vecTar.txt
 # Phase 1: the requested number of dynamic-weight RSEAS rounds. Probe curves
 # are regenerated on rounds 1, 1+RBGO, 1+2*RBGO, ... within this phase.
 for ((i=1; i<=ROUNDS; i++)); do
+    echo "RSEAS round $i/$ROUNDS."
     set_round_constraints "$i"
     run_bnb "$GRAPHLET_K" "$CURRENT" > vecInS.txt
     set_round_rseas_state "$i" vecInS.txt vecTar.txt
@@ -1968,18 +1882,13 @@ done
 
 # Phase 2: RMSE starts a new probe-refresh cadence. Thus its first round always
 # regenerates outinp, followed by every RBGO-th round within the RMSE phase.
-echo
-if (( RMSE_ROUNDS > 0 )); then
-    echo "Completed $ROUNDS RSEAS rounds. Starting $RMSE_ROUNDS equal-weight RMSE polishing rounds."
-else
-    echo "Completed $ROUNDS RSEAS rounds. No RMSE polishing rounds were requested."
-fi
 
 evb="$TIGHTEST_EVB"
 degb="$TIGHTEST_DEGB"
 hdgb="$TIGHTEST_HDGB"
 
 for ((j=1; j<=RMSE_ROUNDS; j++)); do
+    echo "RMSE round $j/$RMSE_ROUNDS."
     set_rmse_round_constraints "$j"
 
     if (( (j-1) % RBGO == 0 )); then
@@ -1995,12 +1904,4 @@ for ((j=1; j<=RMSE_ROUNDS; j++)); do
 done
 
 cp "$CURRENT" "$FINAL"
-echo
-echo "Final output stored in $FINAL after $ROUNDS RSEAS rounds and $RMSE_ROUNDS RMSE rounds; outinp was regenerated every $RBGO round(s) within each phase."
-rm -f baseline_val_*.txt outinp_val_*.txt synth1_*.txt \
-      outinp_l_val_*.txt suminp_val_*.txt bext_val_*.txt \
-          inp1l_*.txt synth_base_*.txt tmp_round*.txt PIS*.txt
-rm -f round_results.tmp inp.txt inpl.txt vecBS*.txt vecOutty.txt trfBS.txt target_c.txt smth.txt bres.tmp evh.txt \
-          out_inplxzx.txt data1.txt data_middle.txt vecInS.txt vecTar.txt bextxzx.txt suminpxzx.txt data_middle1.txt idk.txt \
-          expfy_samples_done.tmp .expfy_samples_*.tmp
-rm -rf baseline .generate_outinp_* .run_round.*
+echo "Saved graph: $FINAL"

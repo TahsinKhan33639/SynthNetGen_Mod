@@ -6,6 +6,12 @@
 #include <cmath>
 using namespace std;
 
+string shell_quote(const string& value) {
+    string quoted = "'";
+    for (char c : value) quoted += c == '\'' ? "'\\''" : string(1, c);
+    return quoted + "'";
+}
+
 int main(int argc, char* argv[]) {
     if (argc != 3) {
         cerr << "Usage: " << argv[0] << " <k> <file1>\n";
@@ -14,12 +20,15 @@ int main(int argc, char* argv[]) {
 
     int k = stoi(argv[1]);
     string file1 = argv[2];
+    const char* output_env = getenv("BNB_OUTPUT_FILE");
+    const string output_file = output_env && *output_env ? output_env : "data1.txt";
 
-
+    // The caller supplies a shell-quoted graph argument. BLANT keeps its
+    // resource-directory cwd while its output can live in private scratch.
     string cmd = "./blant -k " + to_string(k)
                 + " -s EBE -n 100000 "
                 + file1
-                + " > " + "data1.txt";
+                + " > " + shell_quote(output_file)  + " 2>/dev/null";
 
     int ret = system(cmd.c_str());
     if (ret != 0) {
@@ -30,10 +39,10 @@ int main(int argc, char* argv[]) {
     // --- Read first column from data1.txt ---
     vector<double> a;
 
-    ifstream f1("data1.txt");
+    ifstream f1(output_file);
 
     if (!f1) {
-        cerr << "Error: could not open data1.txt\n";
+        cerr << "Error: could not open " << output_file << "\n";
         return 1;
     }
 	int xtra;
@@ -61,4 +70,3 @@ int main(int argc, char* argv[]) {
 	cout << endl;
     return 0;
 }
-//  + " 2>/dev/null"

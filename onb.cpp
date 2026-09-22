@@ -5,7 +5,32 @@
 #include <fstream>
 #include <cmath>
 #include <set>
+#include <cstdio>
+#include <unistd.h>
 using namespace std;
+
+string shell_quote(const string& value) {
+    string quoted = "'";
+    for (char c : value) quoted += c == '\'' ? "'\\''" : string(1, c);
+    return quoted + "'";
+}
+
+struct HeaderedInput {
+    string path;
+
+    HeaderedInput() {
+        char name[] = ".onb_input.XXXXXX";
+        const int fd = mkstemp(name);
+        if (fd >= 0) {
+            close(fd);
+            path = name;
+        }
+    }
+
+    ~HeaderedInput() {
+        if (!path.empty()) remove(path.c_str());
+    }
+};
 
 int main(int argc, char* argv[]) {
     if (argc != 3) {
@@ -35,12 +60,19 @@ int main(int argc, char* argv[]) {
 
     int n = nodes.size();
 
-    string backup = file1 + ".bak";
-    system(("cp " + file1 + " " + backup).c_str());
-
-    // Add #node #edge
-    ifstream orig(backup);
-    ofstream fout(file1);
+    // ORCA needs a header. Keep that copy in the caller's private working
+    // directory so neither successful counting nor failures modify the graph.
+    HeaderedInput headered;
+    if (headered.path.empty()) {
+        cerr << "Error creating headered scratch input\n";
+        return 1;
+    }
+    ifstream orig(file1);
+    ofstream fout(headered.path);
+    if (!orig || !fout) {
+        cerr << "Error preparing headered scratch input\n";
+        return 1;
+    }
 
     fout << n << " " << edges << "\n";
     string line;
@@ -48,20 +80,24 @@ int main(int argc, char* argv[]) {
         fout << line << "\n";
     }
 
-    orig.close();
     fout.close();
+    if (orig.bad() || !fout) {
+        cerr << "Error writing headered scratch input\n";
+        return 1;
+    }
+    orig.close();
 
     // Run orca
-    string cmd1 = "./orca " + k + " " + file1 + " data_middle.txt" + " > smth.txt";
+    string cmd1 = "./orca " + shell_quote(k) + " " + shell_quote(headered.path)
+                  + " " + shell_quote("data_middle.txt") + " > " + shell_quote("smth.txt");
     if (system(cmd1.c_str()) != 0) {
         cerr << "Error running orca\n";
         return 1;
     }
 
-    system(("mv " + backup + " " + file1).c_str());
-
     // Run otb2
-	string cmd1_1 = "./otb2 " + k + " < data_middle.txt > data1.txt";
+	string cmd1_1 = "./otb2 " + shell_quote(k) + " < " + shell_quote("data_middle.txt")
+                       + " > " + shell_quote("data1.txt");
     if (system(cmd1_1.c_str()) != 0) {
         cerr << "Error running obt2\n";
         return 1;

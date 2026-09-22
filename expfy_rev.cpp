@@ -1690,6 +1690,16 @@ public:
         validate_mode(mode1);
         validate_mode(mode2);
 
+        // A self-pair is one batch on the same evolving graph. Report its
+        // completed quota entirely in slot 1, including a (0, b) request.
+        if (mode1 == mode2) {
+            if (requested2 > numeric_limits<int>::max() - requested1) {
+                throw runtime_error("combined self-pair quota exceeds the integer limit");
+            }
+            requested1 += requested2;
+            requested2 = 0;
+        }
+
         requested1_ = requested1;
         requested2_ = requested2;
         mode1_ = mode1;
@@ -3776,11 +3786,18 @@ int main(int argc, char* argv[]) {
     ios::sync_with_stdio(false);
     cin.tie(nullptr);
 
-    if (argc < 10) {
+    // rpll.sh queries backend capabilities before providing graph arguments.
+    if (argc == 2 && string(argv[1]) == "--max-transformation") {
+        cout << MAX_TRANSFORMATION << '\n';
+        return 0;
+    }
+
+    if (argc != 9 && argc != 10) {
         cerr << "Usage: " << argv[0]
              << " <target_file> <synth_file> <num_samples> <num_samples2>"
-             << " <mode> <mode2> <ignored_evb> <degbound_code> <hdgbound>"
-             << " [completed_samples_file]\n";
+             << " <mode> <mode2> <degbound_code> <hdgbound>"
+             << " [completed_samples_file]\n"
+             << "   or: " << argv[0] << " --max-transformation\n";
         return 1;
     }
 
@@ -3792,20 +3809,15 @@ int main(int argc, char* argv[]) {
         const int mode1 = parse_int(argv[5], "mode");
         const int mode2 = parse_int(argv[6], "mode2");
 
-        // argv[7] intentionally remains in the interface so existing rpll.sh
-        // calls continue to work. The eigenvector system and evb constraint are
-        // completely removed; this text is neither parsed nor used.
-        (void)argv[7];
-
-        const int degbound_code = parse_int(argv[8], "degbound_code");
-        const int hdgbound = parse_int(argv[9], "hdgbound");
+        const int degbound_code = parse_int(argv[7], "degbound_code");
+        const int hdgbound = parse_int(argv[8], "hdgbound");
         if (degbound_code < 0 || hdgbound < 0) {
             throw runtime_error("degbound_code and hdgbound must be nonnegative");
         }
         const double degree_log_bound =
             static_cast<double>(degbound_code) / 140.0;
         const string completed_samples_file =
-            argc >= 11 ? argv[10] : "expfy_samples_done.tmp";
+            argc == 10 ? argv[9] : "expfy_samples_done.tmp";
 
         const EdgeListData target_data = read_edge_list(target_file);
         const EdgeListData synth_data = read_edge_list(synth_file);
