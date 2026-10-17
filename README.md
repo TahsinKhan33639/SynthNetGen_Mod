@@ -8,11 +8,13 @@ chmod +x build.sh
 
 ## Usage
 ```bash
-./rpll.sh <target> <output> <rounds>
+./rpll.sh <k:4|5> <target> <output> <RSEAS_optimizing_rounds> <RMSE_optimizing_round> <r>
 ```
 or
 ```bash
-./rpll.sh <target> <output> <synth_base> <rounds>
+./rpll.sh <k:4|5> <target> <output> <synth_base> <RSEAS_optimizing_rounds> <RMSE_optimizing_round> <r>
 ```
 
-Edit `weights4.txt` first and then use `rpll.sh` with at most 24 rounds.
+Where `k` is the graphlet size and the baseline resuls are computed every `r` rounds.
+
+Use `rpllb.sh` instead of `rpll.sh` to use `blant` instead or `orca`.
