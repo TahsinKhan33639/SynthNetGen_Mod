@@ -3,6 +3,7 @@ set -e
 
 SCMD_PROJECT_DIR=$(dirname -- "$(realpath -- "${BASH_SOURCE[0]}")")
 source "$SCMD_PROJECT_DIR/pipeline_runtime.sh"
+source "$SCMD_PROJECT_DIR/disabled_config.sh"
 
 # Node-dependent work is calibrated to a 1,000-node graph.  EFFECTIVE_N is
 # clamped so small graphs still get enough trials for stable estimates while
@@ -463,7 +464,10 @@ if ! [[ "$RBGO" =~ ^[1-9][0-9]*$ ]]; then
     exit 1
 fi
 
+load_disabled_transformations "$SCMD_PROJECT_DIR/disabled.txt"
 initialize_pipeline_run onb
+DISABLED_FILE="$RUN_DIR/disabled.txt"
+printf '%s' "$DISABLED_CONFIG_CONTENT" > "$DISABLED_FILE"
 echo "$TARGET0" >> wcic.txt
 
 configure_graphlet_mode
@@ -682,7 +686,14 @@ CANDIDATE_LIMIT="$MAX_TRANSFORMATION"
 if (( ${EXPFY_MODE_LIMIT:-MAX_TRANSFORMATION} < MAX_TRANSFORMATION )); then
     CANDIDATE_LIMIT="$EXPFY_MODE_LIMIT"
 fi
-CANDS=($(seq 1 "$CANDIDATE_LIMIT" | grep -v -E '^(25|26)$'))
+CANDS=()
+for ((i=1; i<=CANDIDATE_LIMIT; i++)); do
+    # These IDs have no implementation in expfy, regardless of configuration.
+    if (( i == 25 || i == 26 )); then continue; fi
+    if (( ! ${DISABLED_TRANSFORMATIONS[$i]:-0} )); then
+        CANDS+=("$i")
+    fi
+done
 ACTIVE_CANDS=("${CANDS[@]}")
 
 # Map each transformation number to the graphlet ID required by expfy.
@@ -1048,8 +1059,7 @@ refresh_rare_graphlets() {
     done
 
     if (( ${#ACTIVE_CANDS[@]} == 0 )); then
-        echo "No transformations remain after rare-graphlet filtering." >&2
-        return 1
+        echo "No enabled transformations remain after rare-graphlet filtering; rounds will use EVC only."
     fi
 }
 
@@ -1293,8 +1303,8 @@ run_round() {
         had_score=$(objective_score "$F0_ABS" "$INPL")
 
         # ---------------------------------------------------------
-        # 1. Generate and evaluate six EVC candidates in parallel: small and
-        #    large runs of evc1, evc2, and the union/intersection evc3.
+        # 1. Generate and evaluate enabled EVC candidates in parallel: small
+        #    and large runs of evc1, evc2, and the union/intersection evc3.
         # ---------------------------------------------------------
         local EVC_DIR="$ROUND_DIR/evc"
         mkdir -p "$EVC_DIR"
@@ -1320,21 +1330,14 @@ run_round() {
             CURRENT_EV_DISTANCE EVC_DISTANCE_LIMIT EVC_REFERENCE_REASON \
             <<< "$EVC_REFERENCE"
 
-        local -a EVC_LABELS=(
-            outpev11 outpev12
-            outpev21 outpev22
-            outpev31 outpev32
-        )
-        local -a EVC_TOOLS=(
-            evc1 evc1
-            evc2 evc2
-            evc3 evc3
-        )
-        local -a EVC_AMOUNTS=(
-            "$OUTPEV_SMALL_SAMPLES" "$OUTPEV_LARGE_SAMPLES"
-            "$OUTPEV_SMALL_SAMPLES" "$OUTPEV_LARGE_SAMPLES"
-            "$OUTPEV_SMALL_SAMPLES" "$OUTPEV_LARGE_SAMPLES"
-        )
+        local -a EVC_LABELS=() EVC_TOOLS=() EVC_AMOUNTS=()
+        local EVC_ID
+        for EVC_ID in 1 2 3; do
+            if (( ${DISABLED_EVC[$EVC_ID]:-0} )); then continue; fi
+            EVC_LABELS+=("outpev${EVC_ID}1" "outpev${EVC_ID}2")
+            EVC_TOOLS+=("evc$EVC_ID" "evc$EVC_ID")
+            EVC_AMOUNTS+=("$OUTPEV_SMALL_SAMPLES" "$OUTPEV_LARGE_SAMPLES")
+        done
         local -a EVC_PIDS=()
         local EVC_FAILED=0
         local IDX LABEL TOOL AMOUNT PID
@@ -1456,6 +1459,12 @@ run_round() {
         # 2. Read all transformation probes once and score every active pair
         #    in one bxk4f invocation. No shell worker or process per pair.
         # ---------------------------------------------------------
+        if (( ${#ACTIVE_CANDS[@]} == 0 )); then
+            cp "$INPUT_ABS" "$OUTPUT_ABS"
+            printf 'Got %s = %.6g (EVC only)\n' "$ROUND_OBJECTIVE" "$had_score"
+            exit 0
+        fi
+
         local RESULTS_FILE="$ROUND_DIR/round_results.tmp"
         local BATCH_INPUT="$ROUND_DIR/bxk4f_batch_input.tmp"
         local -a BATCH_ENABLED=()
@@ -1466,7 +1475,7 @@ run_round() {
         done
 
         # Every ID through MAX_TRANSFORMATION has edge-change metadata. Disabled
-        # entries (unused IDs 25/26 or rarity-filtered modes) have no curve.
+        # entries (configured exclusions or rarity-filtered modes) have no curve.
         # Current/target are raw frequencies; A/B are the measured log
         # displacements already stored by generate_outinp.
         {
@@ -1496,10 +1505,10 @@ run_round() {
         local BATCH_STATUS=0
         local BATCH_STDERR="$ROUND_DIR/bxk4f.stderr"
         if [ "$ROUND_OBJECTIVE" = "RSEAS" ]; then
-            "$BXK4F_ABS" "$GRAPHLET_K" "$RSEAS_E" "${RSEAS_WEIGHTS[@]}" \
+            "$BXK4F_ABS" "$GRAPHLET_K" "$RSEAS_E" "${RSEAS_WEIGHTS[@]}" "$DISABLED_FILE" \
                 < "$BATCH_INPUT" > "$RESULTS_FILE.pending" 2> "$BATCH_STDERR" || BATCH_STATUS=$?
         else
-            "$BXK4F_ABS" "$GRAPHLET_K" \
+            "$BXK4F_ABS" "$GRAPHLET_K" "$DISABLED_FILE" \
                 < "$BATCH_INPUT" > "$RESULTS_FILE.pending" 2> "$BATCH_STDERR" || BATCH_STATUS=$?
         fi
         if (( BATCH_STATUS != 0 )); then

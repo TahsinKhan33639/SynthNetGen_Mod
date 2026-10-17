@@ -1,14 +1,13 @@
 // Batch replacement for bxk4f: one invocation evaluates every active pair.
-// This file is self-contained; the bxk4one programs may keep using their
-// existing rseas_metric_k45.hpp unchanged.
+// The bxk4one programs may keep using their existing metric headers unchanged.
 #include <bits/stdc++.h>
+#include "bxk4f_disabled.hpp"
 using namespace std;
 using Vec = vector<double>;
 
 namespace {
 
 // Support transformation IDs through 95, including the new modes 84..95.
-// IDs 25/26 stay disabled: 93 usable modes and 95 batch metadata slots.
 constexpr int MAX_TRANSFORMATION = 95;
 
 constexpr double LOG_FLOOR = -15.0;
@@ -181,7 +180,8 @@ void read_vector(istream& input, Vec& values, const string& label,
     }
 }
 
-vector<Transformation> read_batch(istream& input, Vec& initial, Vec& target) {
+vector<Transformation> read_batch(istream& input, Vec& initial, Vec& target,
+                                  const bxk4f_disabled::Config& disabled) {
     string magic;
     if (!(input >> magic) || magic != "BXK4F_BATCH_V1") {
         throw runtime_error("expected BXK4F_BATCH_V1; rebuild rpll and both "
@@ -198,7 +198,6 @@ vector<Transformation> read_batch(istream& input, Vec& initial, Vec& target) {
     array<bool, MAX_TRANSFORMATION + 1> seen{};
     vector<Transformation> transformations;
     transformations.reserve(static_cast<size_t>(count));
-    size_t active_count = 0;
     for (int record = 0; record < count; ++record) {
         Transformation t(initial.size());
         t.id = read_integer(input, "transformation ID");
@@ -224,13 +223,14 @@ vector<Transformation> read_batch(istream& input, Vec& initial, Vec& target) {
             if (!isfinite(2.0 * t.curve.kb)) {
                 throw runtime_error(label + " has an excessively large scale");
             }
-            ++active_count;
         }
+        // Read the complete probe curve before applying configuration: the
+        // batch enabled flag determines which fields are present on stdin.
+        if (disabled.transformations[t.id]) t.enabled = false;
         transformations.push_back(move(t));
     }
     input >> ws;
     if (!input.eof()) throw runtime_error("extra data after the transformation table");
-    if (active_count == 0) throw runtime_error("no active transformations in batch");
 
     for (size_t i = 0; i < initial.size(); ++i) {
         initial[i] = safe_log(initial[i]);
@@ -373,16 +373,17 @@ int parse_k(const char* text) {
 int main(int argc, char* argv[]) {
     ios::sync_with_stdio(false);
     cin.tie(nullptr);
-    if (argc != 2) {
+    if (argc != 2 && argc != 3) {
         cerr << "Usage: " << argv[0]
-             << " <k:4|5> < batch_input.txt > round_results.tmp\n";
+             << " <k:4|5> [disabled_file] < batch_input.txt > round_results.tmp\n";
         return 1;
     }
     try {
         const int k = parse_k(argv[1]);
+        const auto disabled = bxk4f_disabled::load(argc == 3 ? argv[2] : "disabled.txt");
         const size_t dimension = k == 4 ? 6 : 21;
         Vec initial(dimension), target(dimension), zero(dimension, 0.0);
-        auto transformations = read_batch(cin, initial, target);
+        auto transformations = read_batch(cin, initial, target, disabled);
         const auto score = [&](const Vec& a, const Vec& b) {
             return score_displacements(target, initial, a, b);
         };
