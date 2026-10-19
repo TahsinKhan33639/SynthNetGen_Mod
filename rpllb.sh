@@ -5,10 +5,10 @@ SCMD_PROJECT_DIR=$(dirname -- "$(realpath -- "${BASH_SOURCE[0]}")")
 source "$SCMD_PROJECT_DIR/pipeline_runtime.sh"
 source "$SCMD_PROJECT_DIR/disabled_config.sh"
 
-# Dense-graph setup: compute node orbits once on the initial synthetic graph.
-# Keep this data_middle1.txt unchanged for all later selection and filtering.
-# Use a headered temporary copy rather than modifying the input graph.
-initialize_node_weights() (
+# Prepare four-node orbits for the next expfy input in the current directory.
+# Call once per fixed input, then reuse/copy the data across its probes.
+# bnb only estimates frequencies, so run ORCA on a headered temporary copy.
+prepare_node_weights() (
     set -e
     local GRAPH_ABS="$1"
     local ORCA_INPUT ORCA_OUTPUT ORBIT_NODE_COUNT
@@ -52,7 +52,7 @@ EOF_ORCA_INPUT
         echo "ORCA did not produce $ORBIT_NODE_COUNT complete 15-column rows for $GRAPH_ABS." >&2
         exit 1
     fi
-    mv -- "$ORCA_OUTPUT" "$RUN_DIR/data_middle1.txt" || exit 1
+    mv -- "$ORCA_OUTPUT" data_middle1.txt || exit 1
 )
 
 # BLANT must retain its resource-directory cwd, while its captured output is
@@ -69,17 +69,6 @@ run_bnb() (
     cd -- "$BLANT_RESOURCE_DIR" || return 1
     "$SCMD_PROJECT_DIR/bnb" "$K" "$GRAPH_QUOTED"
 )
-
-run_expfy() {
-    # Measure the current graph with BLANT while retaining the initial ORCA
-    # weights. Candidate directories receive a copy in prepare_serial_worker.
-    run_bnb 4 "$2" > bres.tmp || return 1
-    if [ ! -r data_middle1.txt ]; then
-        echo "Initial node-selection weights are missing: data_middle1.txt." >&2
-        return 1
-    fi
-    invoke_expfy "$@"
-}
 
 # Node-dependent work is calibrated to a 1,000-node graph.  EFFECTIVE_N is
 # clamped so small graphs still get enough trials for stable estimates while
@@ -556,15 +545,21 @@ build_round_constraint_schedule
 if (( ! INITIAL_GRAPH_GIVEN )); then
     echo "Generating baseline."
     ./gen_deg2 "$TARGET" synth_base_1.txt
-    initialize_node_weights synth_base_1.txt || exit 1
+    prepare_node_weights synth_base_1.txt
 
-    run_expfy "$TARGET" synth_base_1.txt "$INIT_PRIMARY_SAMPLES" "$INIT_PRIMARY_SAMPLES" 1 8 20 "$INIT_HDGB_1" > synth_base_2.txt
-    run_expfy "$TARGET" synth_base_2.txt "$INIT_MAIN_SAMPLES" "$INIT_MAIN_SAMPLES" 1 8 18 "$INIT_HDGB_2" > synth_base_3.txt
-    run_expfy "$TARGET" synth_base_3.txt "$INIT_MAIN_SAMPLES" "$INIT_MAIN_SAMPLES" 1 8 18 "$INIT_HDGB_3" > synth_base_4.txt
-    run_expfy "$TARGET" synth_base_4.txt "$INIT_MAIN_SAMPLES" "$INIT_MAIN_SAMPLES" 1 8 17 "$INIT_HDGB_4" > synth_base_5.txt
-    run_expfy "$TARGET" synth_base_5.txt "$INIT_MAIN_SAMPLES" "$INIT_SECONDARY_SAMPLES" 1 17 16 "$INIT_HDGB_5" > synth_base_6.txt
-    run_expfy "$TARGET" synth_base_6.txt "$INIT_MAIN_SAMPLES" "$INIT_SECONDARY_SAMPLES" 1 17 15 "$INIT_HDGB_6" > synth_base_7.txt
-    run_expfy "$TARGET" synth_base_7.txt "$INIT_MAIN_SAMPLES" "$INIT_SECONDARY_SAMPLES" 1 17 14 "$INIT_HDGB_7" > synth_base_8.txt
+    invoke_expfy "$TARGET" synth_base_1.txt "$INIT_PRIMARY_SAMPLES" "$INIT_PRIMARY_SAMPLES" 1 8 20 "$INIT_HDGB_1" > synth_base_2.txt
+    prepare_node_weights synth_base_2.txt
+    invoke_expfy "$TARGET" synth_base_2.txt "$INIT_MAIN_SAMPLES" "$INIT_MAIN_SAMPLES" 1 8 18 "$INIT_HDGB_2" > synth_base_3.txt
+    prepare_node_weights synth_base_3.txt
+    invoke_expfy "$TARGET" synth_base_3.txt "$INIT_MAIN_SAMPLES" "$INIT_MAIN_SAMPLES" 1 8 18 "$INIT_HDGB_3" > synth_base_4.txt
+    prepare_node_weights synth_base_4.txt
+    invoke_expfy "$TARGET" synth_base_4.txt "$INIT_MAIN_SAMPLES" "$INIT_MAIN_SAMPLES" 1 8 17 "$INIT_HDGB_4" > synth_base_5.txt
+    prepare_node_weights synth_base_5.txt
+    invoke_expfy "$TARGET" synth_base_5.txt "$INIT_MAIN_SAMPLES" "$INIT_SECONDARY_SAMPLES" 1 17 16 "$INIT_HDGB_5" > synth_base_6.txt
+    prepare_node_weights synth_base_6.txt
+    invoke_expfy "$TARGET" synth_base_6.txt "$INIT_MAIN_SAMPLES" "$INIT_SECONDARY_SAMPLES" 1 17 15 "$INIT_HDGB_6" > synth_base_7.txt
+    prepare_node_weights synth_base_7.txt
+    invoke_expfy "$TARGET" synth_base_7.txt "$INIT_MAIN_SAMPLES" "$INIT_SECONDARY_SAMPLES" 1 17 14 "$INIT_HDGB_7" > synth_base_8.txt
 
     PRE_INIT_SYNTH=synth_base_8.txt
 else
@@ -577,7 +572,6 @@ else
         echo "Target has $NODE_COUNT nodes but base synth has $SYNTH_NODE_COUNT; expfy requires equal node counts." >&2
         exit 1
     fi
-    initialize_node_weights "$PRE_INIT_SYNTH" || exit 1
 fi
 
 # PIS uses one target vector, unit weights, and one error range fixed from the
@@ -1212,7 +1206,7 @@ apply_exp() {
     REQUESTED_SAMPLES=$(scale_apply_samples "$REQUESTED_SCALE" "$DIVISOR")
 
     SAMPLE_FILE=$(mktemp ".expfy_samples.XXXXXX.tmp")
-    if ! run_expfy "$TARGET" "$INPUT_FILE" "$REQUESTED_SAMPLES" 0 \
+    if ! invoke_expfy "$TARGET" "$INPUT_FILE" "$REQUESTED_SAMPLES" 0 \
         "$VAL" 1 "$degb" "$hdgb" "$SAMPLE_FILE" \
         > "$OUTPUT_FILE"; then
         rm -f "$SAMPLE_FILE" "$OUTPUT_FILE"
@@ -1273,7 +1267,7 @@ apply_exp2() {
     REQUESTED_SAMPLES2=$(scale_apply_samples "$REQUESTED_SCALE2" "$DIVISOR2")
 
     SAMPLE_FILE=$(mktemp ".expfy_samples.XXXXXX.tmp")
-    if ! run_expfy "$TARGET" "$INPUT_FILE" \
+    if ! invoke_expfy "$TARGET" "$INPUT_FILE" \
         "$REQUESTED_SAMPLES1" "$REQUESTED_SAMPLES2" "$VAL" "$VAL2" \
         "$degb" "$hdgb" "$SAMPLE_FILE" > "$OUTPUT_FILE"; then
         rm -f "$SAMPLE_FILE" "$OUTPUT_FILE"
@@ -1489,6 +1483,10 @@ run_round() {
             exit 0
         fi
 
+        # EVC may have replaced INPUT_ABS. All pair candidates and both of
+        # their scale trials use this same input, so count its orbits once.
+        prepare_node_weights "$INPUT_ABS"
+
         local RESULTS_FILE="$ROUND_DIR/round_results.tmp"
         local BATCH_INPUT="$ROUND_DIR/bxk4f_batch_input.tmp"
         local -a BATCH_ENABLED=()
@@ -1593,7 +1591,7 @@ run_round() {
                 trap 'rm -rf -- "$WORK_DIR"' EXIT
                 cd "$WORK_DIR"
 
-                # apply_exp2 refers to TARGET dynamically and invokes run_expfy.
+                # apply_exp2 refers to TARGET dynamically and invokes the selected backend.
                 local TARGET="$TARGET_ABS"
                 local STAGE1="candidate_stage1.graph"
                 local FINAL_CANDIDATE="candidate_final.graph"
@@ -1731,9 +1729,10 @@ run_round() {
                 PROBE_GRAPH="$REFINE_DIR/probe_${REFINE_ITER}.graph"
                 REFINED_CANDIDATE="$REFINE_DIR/refined_candidate_${REFINE_ITER}.graph"
 
-                # Refresh the objective vector; node-selection weights remain
-                # those of the initial synthetic graph, including in k=5 runs.
+                # Both applications below start from REFINE_GRAPH. Refresh its
+                # four-node orbits once, even when scoring five-node graphlets.
                 run_bnb "$GRAPHLET_K" "$REFINE_GRAPH" > "$CURRENT_VEC"
+                prepare_node_weights "$REFINE_GRAPH"
 
                 # Probe by applying the same pair once more at its latest
                 # accepted effective scales.
@@ -1880,6 +1879,7 @@ for ((i=1; i<=ROUNDS; i++)); do
     set_round_rseas_state "$i" vecInS.txt vecTar.txt
 
     if (( (i-1) % RBGO == 0 )); then
+        prepare_node_weights "$CURRENT"
         refresh_rare_graphlets data_middle1.txt
         generate_outinp "$CURRENT"
     fi
@@ -1902,6 +1902,7 @@ for ((j=1; j<=RMSE_ROUNDS; j++)); do
 
     if (( (j-1) % RBGO == 0 )); then
         run_bnb "$GRAPHLET_K" "$CURRENT" > vecInS.txt
+        prepare_node_weights "$CURRENT"
         refresh_rare_graphlets data_middle1.txt
         generate_outinp "$CURRENT"
     fi
