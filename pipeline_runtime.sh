@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 
 # Resolve caller paths before moving each run into its own workspace.
+# The optional second tool supplies node-orbit data; exact pipelines use ORCA.
 initialize_pipeline_run() {
     local COUNTER="$1"
+    local NODE_COUNTER="${2:-orca}"
     local TOOL TMP_PARENT
     local -a REQUIRED_TOOLS=(cleanup evs evc1 evc2 evc3
-        bxk4f_rseas bxk4f_rmse bxk4one_rseas bxk4one_rmse "$COUNTER" orca)
+        bxk4f_rseas bxk4f_rmse bxk4one_rseas bxk4one_rmse "$COUNTER" "$NODE_COUNTER")
 
     TARGET0=$(realpath -e -- "$TARGET0") || return 1
     FINAL=$(realpath -m -- "$FINAL") || return 1

@@ -7,6 +7,7 @@ g++ -O2 cleanup.cpp -o cleanup
 g++ -O2 expfy.cpp -o expfy
 g++ -O2 onb.cpp -o onb
 g++ -O2 bnb.cpp -o bnb
+g++ -O2 -std=c++17 sampled_orbits.cpp -o sampled_orbits
 g++ -O2 gen_deg2.cpp -o gen_deg2
 
 g++ -O2 bxk4f_rseas.cpp -o bxk4f_rseas
@@ -21,4 +22,4 @@ g++ -O2 evc1.cpp -o evc1
 g++ -O2 evc2.cpp -o evc2
 g++ -O2 evc3.cpp -o evc3
 
-chmod +x rpll.sh rpllb.sh
+chmod +x rpll.sh rpllb.sh rplld.sh

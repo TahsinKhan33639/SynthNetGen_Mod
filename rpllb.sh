@@ -393,12 +393,6 @@ configure_node_scaled_parameters() {
 
     EFFECTIVE_N=$(clamp_int "$NODE_COUNT" "$MIN_EFFECTIVE_N" "$MAX_EFFECTIVE_N")
 
-    # Initial synthesis passes.  These are direct expfy success targets, so
-    # they scale with n.  The first, unusually heavy pass gets an extra cap.
-    INIT_PRIMARY_SAMPLES=$(clamp_int "$(scale_from_reference 50000)" 10000 100000)
-    INIT_MAIN_SAMPLES=$(clamp_int "$(scale_from_reference 10000)" 2500 50000)
-    INIT_SECONDARY_SAMPLES=$(clamp_int "$(scale_from_reference 1000)" 250 5000)
-
     # Preliminary spectral rewiring and the per-round EVC probes.
     PIS1_SAMPLES=$(scale_from_reference 3000)
     PIS2_SAMPLES=$(scale_from_reference 1000)
@@ -410,13 +404,6 @@ configure_node_scaled_parameters() {
     # should scale with node count. evb is dimensionless. degb is an encoded
     # log-degree tolerance; expfy divides it by 140 and computes its separate
     # n-dependent absolute fallback internally, so rpll does not rescale it.
-    INIT_HDGB_1=$(scale_from_reference 50)
-    INIT_HDGB_2=$(scale_from_reference 40)
-    INIT_HDGB_3=$(scale_from_reference 30)
-    INIT_HDGB_4=$(scale_from_reference 26)
-    INIT_HDGB_5=$(scale_from_reference 24)
-    INIT_HDGB_6=$(scale_from_reference 23)
-    INIT_HDGB_7=$(scale_from_reference 22)
     # The last optimization round uses this value exactly.  Earlier rounds
     # are generated backward from it by multiplying by ROUND_BACKWARD_FACTOR.
     TIGHTEST_HDGB=$(scale_from_reference "$TIGHTEST_HDGB_REFERENCE")
@@ -439,6 +426,8 @@ build_round_constraint_schedule() {
     ROUND_EVB_SCHEDULE=()
     ROUND_DEGB_SCHEDULE=()
     ROUND_HDGB_SCHEDULE=()
+
+    if (( ROUNDS == 0 )); then return 0; fi
 
     ROUND_EVB_SCHEDULE[$ROUNDS]="$TIGHTEST_EVB"
     ROUND_DEGB_SCHEDULE[$ROUNDS]="$TIGHTEST_DEGB"
@@ -480,8 +469,7 @@ set_round_constraints() {
 set_rmse_round_constraints() {
     local ROUND_INDEX="$1"
 
-    # The RSEAS schedule already reaches these tightest values on its last
-    # round. Keep them fixed during every appended polishing round.
+    # RMSE uses the tightest constraints even when RSEAS is skipped.
     evb="$TIGHTEST_EVB"
     degb="$TIGHTEST_DEGB"
     hdgb="$TIGHTEST_HDGB"
@@ -516,8 +504,8 @@ if ! [[ "$GRAPHLET_K" =~ ^[45]$ ]]; then
     echo "Graphlet size k must be 4 or 5, not '$GRAPHLET_K'." >&2
     exit 1
 fi
-if ! [[ "$ROUNDS" =~ ^[1-9][0-9]*$ ]]; then
-    echo "RSEAS rounds must be a positive integer, not '$ROUNDS'." >&2
+if ! [[ "$ROUNDS" =~ ^(0|[1-9][0-9]*)$ ]]; then
+    echo "RSEAS rounds must be a nonnegative integer, not '$ROUNDS'." >&2
     exit 1
 fi
 if ! [[ "$RMSE_ROUNDS" =~ ^[0-9]+$ ]]; then
@@ -545,23 +533,7 @@ build_round_constraint_schedule
 if (( ! INITIAL_GRAPH_GIVEN )); then
     echo "Generating baseline."
     ./gen_deg2 "$TARGET" synth_base_1.txt
-    prepare_node_weights synth_base_1.txt
-
-    invoke_expfy "$TARGET" synth_base_1.txt "$INIT_PRIMARY_SAMPLES" "$INIT_PRIMARY_SAMPLES" 1 8 20 "$INIT_HDGB_1" > synth_base_2.txt
-    prepare_node_weights synth_base_2.txt
-    invoke_expfy "$TARGET" synth_base_2.txt "$INIT_MAIN_SAMPLES" "$INIT_MAIN_SAMPLES" 1 8 18 "$INIT_HDGB_2" > synth_base_3.txt
-    prepare_node_weights synth_base_3.txt
-    invoke_expfy "$TARGET" synth_base_3.txt "$INIT_MAIN_SAMPLES" "$INIT_MAIN_SAMPLES" 1 8 18 "$INIT_HDGB_3" > synth_base_4.txt
-    prepare_node_weights synth_base_4.txt
-    invoke_expfy "$TARGET" synth_base_4.txt "$INIT_MAIN_SAMPLES" "$INIT_MAIN_SAMPLES" 1 8 17 "$INIT_HDGB_4" > synth_base_5.txt
-    prepare_node_weights synth_base_5.txt
-    invoke_expfy "$TARGET" synth_base_5.txt "$INIT_MAIN_SAMPLES" "$INIT_SECONDARY_SAMPLES" 1 17 16 "$INIT_HDGB_5" > synth_base_6.txt
-    prepare_node_weights synth_base_6.txt
-    invoke_expfy "$TARGET" synth_base_6.txt "$INIT_MAIN_SAMPLES" "$INIT_SECONDARY_SAMPLES" 1 17 15 "$INIT_HDGB_6" > synth_base_7.txt
-    prepare_node_weights synth_base_7.txt
-    invoke_expfy "$TARGET" synth_base_7.txt "$INIT_MAIN_SAMPLES" "$INIT_SECONDARY_SAMPLES" 1 17 14 "$INIT_HDGB_7" > synth_base_8.txt
-
-    PRE_INIT_SYNTH=synth_base_8.txt
+    PRE_INIT_SYNTH=synth_base_1.txt
 else
     echo "Using supplied baseline."
     if ! SYNTH_NODE_COUNT=$(graph_node_count "$PRE_INIT_SYNTH"); then
@@ -735,10 +707,11 @@ INIT_SYNTH=PIS3.txt
 echo "Baseline ready."
 
 # Initialize the globals used by apply_exp/apply_exp2.  The main loop resets
-# them from the precomputed schedule at the start of every round.
-evb="${ROUND_EVB_SCHEDULE[1]}"
-degb="${ROUND_DEGB_SCHEDULE[1]}"
-hdgb="${ROUND_HDGB_SCHEDULE[1]}"
+# them at the start of every round. Use RMSE's tightest constraints when
+# there is no RSEAS schedule.
+evb="${ROUND_EVB_SCHEDULE[1]:-$TIGHTEST_EVB}"
+degb="${ROUND_DEGB_SCHEDULE[1]:-$TIGHTEST_DEGB}"
+hdgb="${ROUND_HDGB_SCHEDULE[1]:-$TIGHTEST_HDGB}"
 MAX_TRANSFORMATION=95
 CANDIDATE_LIMIT="$MAX_TRANSFORMATION"
 if (( ${EXPFY_MODE_LIMIT:-MAX_TRANSFORMATION} < MAX_TRANSFORMATION )); then
